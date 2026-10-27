@@ -175,6 +175,7 @@ static const struct goodix_berlin_ic_data gt9916_data = {
 static const struct spi_device_id goodix_berlin_spi_ids[] = {
 	{ .name = "gt9897", .driver_data = (long)&gt9897_data },
 	{ .name = "gt9916", .driver_data = (long)&gt9916_data },
+	{ .name = "gt9916S", .driver_data = (long)&gt9916_data },
 	{ },
 };
 MODULE_DEVICE_TABLE(spi, goodix_berlin_spi_ids);
@@ -182,6 +183,7 @@ MODULE_DEVICE_TABLE(spi, goodix_berlin_spi_ids);
 static const struct of_device_id goodix_berlin_spi_of_match[] = {
 	{ .compatible = "goodix,gt9897", .data = &gt9897_data },
 	{ .compatible = "goodix,gt9916", .data = &gt9916_data },
+	{ .compatible = "goodix,gt9916S", .data = &gt9916_data },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, goodix_berlin_spi_of_match);

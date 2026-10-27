@@ -174,6 +174,7 @@ struct goodix_berlin_core {
 
 	/* Runtime parameters extracted from IC_INFO buffer  */
 	u32 touch_data_addr;
+	u32 cmd_addr;
 
 	const struct goodix_berlin_ic_data *ic_data;
 
@@ -349,7 +350,10 @@ static int goodix_berlin_parse_ic_info(struct goodix_berlin_core *cd,
 
 	misc = (struct goodix_berlin_ic_info_misc *)&data[offset];
 	cd->touch_data_addr = le32_to_cpu(misc->touch_data_addr);
+	cd->cmd_addr = le32_to_cpu(misc->cmd_addr);
 
+	dev_info(cd->dev, "IC info parsed: touch_data_addr=0x%x, cmd_addr=0x%x\n",
+		 cd->touch_data_addr, cd->cmd_addr);
 	return 0;
 
 invalid_offset:
@@ -358,6 +362,74 @@ invalid_offset:
 	return -EINVAL;
 }
 
+#define GOODIX_BERLIN_CMD_ACK_OK	0x80
+
+static int goodix_berlin_send_cmd(struct goodix_berlin_core *cd, u8 cmd_code, u8 data_val)
+{
+	u8 buf[16] = {0};
+	u8 ack_buf[16] = {0};
+	u32 checksum = 0;
+	int i, retry, error;
+
+	if (!cd->cmd_addr)
+		return 0;
+
+	buf[0] = 0; /* state */
+	buf[1] = 0; /* ack */
+	buf[2] = 5; /* len: len + cmd + data[0] + 2 checksum bytes = 5 */
+	buf[3] = cmd_code;
+	buf[4] = data_val;
+
+	for (i = 2; i < 5; i++)
+		checksum += buf[i];
+
+	buf[5] = checksum & 0xff;
+	buf[6] = (checksum >> 8) & 0xff;
+
+	dev_info(cd->dev, "sending cmd 0x%02x (data 0x%02x) to 0x%x: %*ph\n",
+		 cmd_code, data_val, cd->cmd_addr, (int)sizeof(buf), buf);
+
+	for (retry = 0; retry < 6; retry++) {
+		error = regmap_raw_write(cd->regmap, cd->cmd_addr, buf, sizeof(buf));
+		if (error) {
+			dev_err(cd->dev, "failed to write cmd 0x%02x: %d\n", cmd_code, error);
+			return error;
+		}
+
+		for (i = 0; i < 10; i++) {
+			usleep_range(1000, 1500);
+			error = regmap_raw_read(cd->regmap, cd->cmd_addr, ack_buf, sizeof(ack_buf));
+			if (error)
+				continue;
+
+			if (ack_buf[1] == GOODIX_BERLIN_CMD_ACK_OK) {
+				dev_info(cd->dev, "cmd 0x%02x ACK OK\n", cmd_code);
+				msleep(40);
+				return 0;
+			}
+		}
+	}
+
+	dev_err(cd->dev, "cmd 0x%02x failed ACK (last ack: 0x%02x)\n", cmd_code, ack_buf[1]);
+	return -ETIMEDOUT;
+}
+
+static int goodix_berlin_set_coor_mode(struct goodix_berlin_core *cd)
+{
+	int error;
+
+	/* Disable rawdata mode (0x90, data 0) */
+	error = goodix_berlin_send_cmd(cd, 0x90, 0x00);
+	if (error)
+		dev_warn(cd->dev, "failed to disable rawdata mode: %d\n", error);
+
+	/* Enable coordinate reporting mode (0x91, data 0x81) */
+	error = goodix_berlin_send_cmd(cd, 0x91, 0x81);
+	if (error)
+		dev_warn(cd->dev, "failed to enable coordinate mode: %d\n", error);
+
+	return error;
+}
 static int goodix_berlin_get_ic_info(struct goodix_berlin_core *cd)
 {
 	u8 *afe_data __free(kfree) = NULL;
@@ -666,6 +738,7 @@ static int goodix_berlin_resume(struct device *dev)
 	error = goodix_berlin_power_on(cd);
 	if (error)
 		return error;
+	goodix_berlin_set_coor_mode(cd);
 
 	enable_irq(cd->irq);
 
@@ -782,6 +855,8 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
 		dev_err(dev, "invalid ic info, abort");
 		return error;
 	}
+
+	goodix_berlin_set_coor_mode(cd);
 
 	error = goodix_berlin_input_dev_config(cd, id);
 	if (error) {
