@@ -249,6 +249,8 @@ struct fastrpc_invoke_ctx {
 	struct fastrpc_invoke_args *args;
 	struct fastrpc_buf_overlap *olaps;
 	struct fastrpc_channel_ctx *cctx;
+	/* The send reference can be consumed by only one reply (cctx->lock). */
+	bool reply_pending;
 };
 
 struct fastrpc_session_ctx {
@@ -270,6 +272,9 @@ struct fastrpc_channel_ctx {
 	int vmcount;
 	struct qcom_scm_vmperm vmperms[FASTRPC_MAX_VMIDS];
 	struct rpmsg_device *rpdev;
+	struct device *dev;
+	/* Serialize sleepable sends against endpoint removal. */
+	struct mutex send_lock;
 	struct fastrpc_session_ctx session[FASTRPC_MAX_SESSIONS];
 	spinlock_t lock;
 	struct idr ctx_idr;
@@ -485,7 +490,7 @@ static int fastrpc_buf_alloc(struct fastrpc_user *fl, struct device *dev,
 static int fastrpc_remote_heap_alloc(struct fastrpc_user *fl, struct device *dev,
 				     u64 size, struct fastrpc_buf **obuf)
 {
-	struct device *rdev = &fl->cctx->rpdev->dev;
+	struct device *rdev = fl->cctx->dev;
 
 	return __fastrpc_buf_alloc(rdev, size, obuf);
 }
@@ -497,6 +502,7 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 	cctx = container_of(ref, struct fastrpc_channel_ctx, refcount);
 
 	idr_destroy(&cctx->ctx_idr);
+	put_device(cctx->dev);
 	kfree(cctx);
 }
 
@@ -693,6 +699,7 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 	ctx->pid = current->pid;
 	ctx->client_id = user->client_id;
 	ctx->cctx = cctx;
+	kref_init(&ctx->refcount);
 	init_completion(&ctx->work);
 	INIT_WORK(&ctx->put_work, fastrpc_context_put_wq);
 
@@ -709,8 +716,6 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 	}
 	ctx->ctxid = ret << 4;
 	spin_unlock_irqrestore(&cctx->lock, flags);
-
-	kref_init(&ctx->refcount);
 
 	return ctx;
 err_idr:
@@ -1218,6 +1223,8 @@ static int fastrpc_invoke_send(struct fastrpc_session_ctx *sctx,
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_user *fl = ctx->fl;
 	struct fastrpc_msg *msg = &ctx->msg;
+	unsigned long flags;
+	bool put_ref;
 	int ret;
 
 	cctx = fl->cctx;
@@ -1232,12 +1239,30 @@ static int fastrpc_invoke_send(struct fastrpc_session_ctx *sctx,
 	msg->sc = ctx->sc;
 	msg->addr = ctx->buf ? ctx->buf->dma_addr : 0;
 	msg->size = roundup(ctx->msg_sz, PAGE_SIZE);
+
+	mutex_lock(&cctx->send_lock);
+	if (!cctx->rpdev) {
+		mutex_unlock(&cctx->send_lock);
+		return -EPIPE;
+	}
+
 	fastrpc_context_get(ctx);
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	ctx->reply_pending = true;
+	spin_unlock_irqrestore(&cctx->lock, flags);
 
 	ret = rpmsg_send(cctx->rpdev->ept, (void *)msg, sizeof(*msg));
 
-	if (ret)
-		fastrpc_context_put(ctx);
+	if (ret) {
+		spin_lock_irqsave(&cctx->lock, flags);
+		put_ref = ctx->reply_pending;
+		ctx->reply_pending = false;
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		if (put_ref)
+			fastrpc_context_put(ctx);
+	}
+	mutex_unlock(&cctx->send_lock);
 
 	return ret;
 
@@ -1255,7 +1280,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	if (!fl->sctx)
 		return -EINVAL;
 
-	if (!fl->cctx->rpdev)
+	if (!READ_ONCE(fl->cctx->rpdev))
 		return -EPIPE;
 
 	if (handle == FASTRPC_INIT_HANDLE && !kernel) {
@@ -1334,7 +1359,7 @@ static bool is_session_rejected(struct fastrpc_user *fl, bool unsigned_pd_reques
 		 * that does not support unsigned PD offload
 		 */
 		if (!fl->cctx->unsigned_support || !unsigned_pd_request) {
-			dev_err(&fl->cctx->rpdev->dev, "Error: Untrusted application trying to offload to signed PD\n");
+			dev_err(fl->cctx->dev, "Error: Untrusted application trying to offload to signed PD\n");
 			return true;
 		}
 	}
@@ -1677,7 +1702,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 
 	fl->sctx = fastrpc_session_alloc(fl);
 	if (!fl->sctx) {
-		dev_err(&cctx->rpdev->dev, "No session available\n");
+		dev_err(cctx->dev, "No session available\n");
 		mutex_destroy(&fl->mutex);
 		kfree(fl);
 		fastrpc_channel_ctx_put(cctx);
@@ -1830,12 +1855,12 @@ static int fastrpc_get_info_from_kernel(struct fastrpc_ioctl_capability *cap,
 
 	err = fastrpc_get_info_from_dsp(fl, dsp_attributes, FASTRPC_MAX_DSP_ATTRIBUTES);
 	if (err == DSP_UNSUPPORTED_API) {
-		dev_info(&cctx->rpdev->dev,
+		dev_info(cctx->dev,
 			 "Warning: DSP capabilities not supported\n");
 		kfree(dsp_attributes);
 		return -EOPNOTSUPP;
 	} else if (err) {
-		dev_err(&cctx->rpdev->dev, "Error: dsp information is incorrect err: %d\n", err);
+		dev_err(cctx->dev, "Error: dsp information is incorrect err: %d\n", err);
 		kfree(dsp_attributes);
 		return err;
 	}
@@ -1861,7 +1886,7 @@ static int fastrpc_get_dsp_info(struct fastrpc_user *fl, char __user *argp)
 	cap.capability = 0;
 
 	if (cap.attribute_id >= FASTRPC_MAX_DSP_ATTRIBUTES) {
-		dev_err(&fl->cctx->rpdev->dev, "Error: invalid attribute: %d, err: %d\n",
+		dev_err(fl->cctx->dev, "Error: invalid attribute: %d, err: %d\n",
 			cap.attribute_id, err);
 		return -EOVERFLOW;
 	}
@@ -2413,9 +2438,11 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	if (!data)
 		return -ENOMEM;
 	kref_init(&data->refcount);
+	data->dev = get_device(rdev);
 	INIT_LIST_HEAD(&data->users);
 	INIT_LIST_HEAD(&data->invoke_interrupted_mmaps);
 	spin_lock_init(&data->lock);
+	mutex_init(&data->send_lock);
 	idr_init(&data->ctx_idr);
 	data->domain_id = domain_id;
 	data->rpdev = rpdev;
@@ -2495,7 +2522,9 @@ err_deregister_fdev:
 
 err_depopulate:
 	/* An early opener may hold a reference if a second node failed. */
+	mutex_lock(&data->send_lock);
 	WRITE_ONCE(data->rpdev, NULL);
+	mutex_unlock(&data->send_lock);
 	of_platform_depopulate(rdev);
 err_free_data:
 	dev_set_drvdata(rdev, NULL);
@@ -2523,11 +2552,13 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	unsigned long flags;
 
 	/* No invocations past this point */
+	mutex_lock(&cctx->send_lock);
 	spin_lock_irqsave(&cctx->lock, flags);
-	cctx->rpdev = NULL;
+	WRITE_ONCE(cctx->rpdev, NULL);
 	list_for_each_entry(user, &cctx->users, user)
 		fastrpc_notify_users(user);
 	spin_unlock_irqrestore(&cctx->lock, flags);
+	mutex_unlock(&cctx->send_lock);
 
 	if (cctx->fdevice)
 		misc_deregister(&cctx->fdevice->miscdev);
@@ -2565,6 +2596,10 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	ctx = idr_find(&cctx->ctx_idr, ctxid);
+	if (ctx && ctx->reply_pending)
+		ctx->reply_pending = false;
+	else
+		ctx = NULL;
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
 	if (!ctx) {
