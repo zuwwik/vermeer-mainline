@@ -190,11 +190,12 @@ struct fastrpc_buf_overlap {
 };
 
 struct fastrpc_buf {
-	struct fastrpc_user *fl;
 	struct dma_buf *dmabuf;
 	struct device *dev;
 	void *virt;
 	dma_addr_t dma_addr;
+	/* Original DMA API handle, without the DSP context-bank SID. */
+	dma_addr_t dma_handle;
 	u64 size;
 	/* Lock for dma buf attachments */
 	struct mutex lock;
@@ -422,12 +423,14 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 
 static void fastrpc_buf_free(struct fastrpc_buf *buf)
 {
-	dma_free_coherent(buf->dev, buf->size, buf->virt,
-			  fastrpc_ipa_to_dma_addr(buf->fl->cctx, buf->dma_addr));
+	/* Exported DMA buffers and the channel heap can outlive their user. */
+	dma_free_coherent(buf->dev, buf->size, buf->virt, buf->dma_handle);
+	put_device(buf->dev);
+	mutex_destroy(&buf->lock);
 	kfree(buf);
 }
 
-static int __fastrpc_buf_alloc(struct fastrpc_user *fl, struct device *dev,
+static int __fastrpc_buf_alloc(struct device *dev,
 			     u64 size, struct fastrpc_buf **obuf)
 {
 	struct fastrpc_buf *buf;
@@ -440,20 +443,21 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl, struct device *dev,
 	INIT_LIST_HEAD(&buf->node);
 	mutex_init(&buf->lock);
 
-	buf->fl = fl;
 	buf->virt = NULL;
 	buf->dma_addr = 0;
 	buf->size = size;
 	buf->dev = dev;
 	buf->raddr = 0;
 
-	buf->virt = dma_alloc_coherent(dev, buf->size, &buf->dma_addr,
+	buf->virt = dma_alloc_coherent(dev, buf->size, &buf->dma_handle,
 				       GFP_KERNEL);
 	if (!buf->virt) {
 		mutex_destroy(&buf->lock);
 		kfree(buf);
 		return -ENOMEM;
 	}
+	buf->dma_addr = buf->dma_handle;
+	get_device(dev);
 
 	*obuf = buf;
 
@@ -466,7 +470,7 @@ static int fastrpc_buf_alloc(struct fastrpc_user *fl, struct device *dev,
 	int ret;
 	struct fastrpc_buf *buf;
 
-	ret = __fastrpc_buf_alloc(fl, dev, size, obuf);
+	ret = __fastrpc_buf_alloc(dev, size, obuf);
 	if (ret)
 		return ret;
 
@@ -483,7 +487,7 @@ static int fastrpc_remote_heap_alloc(struct fastrpc_user *fl, struct device *dev
 {
 	struct device *rdev = &fl->cctx->rpdev->dev;
 
-	return  __fastrpc_buf_alloc(fl, rdev, size, obuf);
+	return __fastrpc_buf_alloc(rdev, size, obuf);
 }
 
 static void fastrpc_channel_ctx_free(struct kref *ref)
@@ -764,7 +768,7 @@ static int fastrpc_dma_buf_attach(struct dma_buf *dmabuf,
 		return -ENOMEM;
 
 	ret = dma_get_sgtable(buffer->dev, &a->sgt, buffer->virt,
-			      fastrpc_ipa_to_dma_addr(buffer->fl->cctx, buffer->dma_addr),
+			      buffer->dma_handle,
 			      buffer->size);
 	if (ret < 0) {
 		dev_err(buffer->dev, "failed to get scatterlist from DMA API\n");
@@ -814,7 +818,7 @@ static int fastrpc_mmap(struct dma_buf *dmabuf,
 	dma_resv_assert_held(dmabuf->resv);
 
 	return dma_mmap_coherent(buf->dev, vma, buf->virt,
-				 fastrpc_ipa_to_dma_addr(buf->fl->cctx, buf->dma_addr), size);
+				 buf->dma_handle, size);
 }
 
 static const struct dma_buf_ops fastrpc_dma_buf_ops = {
@@ -2408,6 +2412,14 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	data = kzalloc_obj(*data);
 	if (!data)
 		return -ENOMEM;
+	kref_init(&data->refcount);
+	INIT_LIST_HEAD(&data->users);
+	INIT_LIST_HEAD(&data->invoke_interrupted_mmaps);
+	spin_lock_init(&data->lock);
+	idr_init(&data->ctx_idr);
+	data->domain_id = domain_id;
+	data->rpdev = rpdev;
+	dev_set_drvdata(&rpdev->dev, data);
 
 	if (vmcount) {
 		data->vmcount = vmcount;
@@ -2436,6 +2448,15 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	secure_dsp = !(of_property_read_bool(rdev->of_node, "qcom,non-secure-domain"));
 	data->secure = secure_dsp;
 	data->soc_data = soc_data;
+	rdev->dma_mask = &data->dma_mask;
+	err = dma_set_mask_and_coherent(rdev, DMA_BIT_MASK(32));
+	if (err)
+		goto err_free_data;
+
+	/* Initialise context banks before publishing the misc devices. */
+	err = of_platform_populate(rdev->of_node, NULL, NULL, rdev);
+	if (err)
+		goto err_depopulate;
 
 	switch (domain_id) {
 	case ADSP_DOMAIN_ID:
@@ -2445,7 +2466,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		data->unsigned_support = false;
 		err = fastrpc_device_register(rdev, data, secure_dsp, domain);
 		if (err)
-			goto err_free_data;
+			goto err_depopulate;
 		break;
 	case CDSP_DOMAIN_ID:
 	case GDSP_DOMAIN_ID:
@@ -2453,7 +2474,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		/* Create both device nodes so that we can allow both Signed and Unsigned PD */
 		err = fastrpc_device_register(rdev, data, true, domain);
 		if (err)
-			goto err_free_data;
+			goto err_depopulate;
 
 		err = fastrpc_device_register(rdev, data, false, domain);
 		if (err)
@@ -2461,24 +2482,8 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		break;
 	default:
 		err = -EINVAL;
-		goto err_free_data;
+		goto err_depopulate;
 	}
-
-	kref_init(&data->refcount);
-
-	rdev->dma_mask = &data->dma_mask;
-	dma_set_mask_and_coherent(rdev, DMA_BIT_MASK(32));
-	INIT_LIST_HEAD(&data->users);
-	INIT_LIST_HEAD(&data->invoke_interrupted_mmaps);
-	spin_lock_init(&data->lock);
-	idr_init(&data->ctx_idr);
-	data->domain_id = domain_id;
-	data->rpdev = rpdev;
-	dev_set_drvdata(&rpdev->dev, data);
-
-	err = of_platform_populate(rdev->of_node, NULL, NULL, rdev);
-	if (err)
-		goto err_deregister_fdev;
 
 	return 0;
 
@@ -2488,8 +2493,13 @@ err_deregister_fdev:
 	if (data->secure_fdevice)
 		misc_deregister(&data->secure_fdevice->miscdev);
 
+err_depopulate:
+	/* An early opener may hold a reference if a second node failed. */
+	WRITE_ONCE(data->rpdev, NULL);
+	of_platform_depopulate(rdev);
 err_free_data:
-	kfree(data);
+	dev_set_drvdata(rdev, NULL);
+	fastrpc_channel_ctx_put(data);
 	return err;
 }
 
