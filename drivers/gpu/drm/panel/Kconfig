@@ -622,17 +622,6 @@ config DRM_PANEL_NOVATEK_NT36523
 	  around the Novatek NT36523 display controller, such as some
 	  Boe panels used in Xiaomi Mi Pad 5 and 5 Pro tablets.
 
-config DRM_PANEL_NOVATEK_NT36532E
-	tristate "Novatek NT36532E panel driver"
-	depends on OF
-	depends on DRM_MIPI_DSI
-	depends on BACKLIGHT_CLASS_DEVICE
-	select DRM_DISPLAY_HELPER
-	help
-	  Say Y here if you want to enable support for the panels built
-	  around the Novatek NT36532E display controller, such as some
-	  Tianma panels used in Xiaomi Pad 6S Pro 12.4 tablets.
-
 config DRM_PANEL_NOVATEK_NT36672A
 	tristate "Novatek NT36672A DSI panel"
 	depends on GPIOLIB
@@ -675,6 +664,18 @@ config DRM_PANEL_NOVATEK_NT37801
 	  Say Y here if you want to enable support for Novatek NT37801 (or
 	  NT37810) AMOLED DSI Video Mode LCD panel module with 1440x3200
 	  resolution.
+
+config DRM_PANEL_ONEPLUS15_A0020
+	tristate "OnePlus 15 A0020 cmd mode DSC panels"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	select DRM_DISPLAY_DSC_HELPER
+	select DRM_DISPLAY_HELPER
+	help
+	  Say Y here if you want to enable support for the OnePlus 15
+	  (kaanapali) AMOLED panels (AC180/AD296/AA601, "A0020" DDIC),
+	  1272x2772, DSI command mode with DSC 1.2.
 
 config DRM_PANEL_NOVATEK_NT39016
 	tristate "Novatek NT39016 RGB/SPI panel"
@@ -976,6 +977,14 @@ config DRM_PANEL_SAMSUNG_S6E3HA8
 
 	    Samsung AMB577PX01 (found in the Samsung S9 smartphone)
 
+
+config DRM_PANEL_SAMSUNG_S6E3HC3
+	tristate "Samsung S6E3HC3 DSI video mode panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	select DRM_DISPLAY_DSC_HELPER
+	select VIDEOMODE_HELPERS
 
 config DRM_PANEL_SAMSUNG_S6E63J0X03
 	tristate "Samsung S6E63J0X03 DSI command mode panel"
@@ -1359,4 +1368,32 @@ config DRM_PANEL_XINPENG_XPP055C272
 	  Say Y here if you want to enable support for the Xinpeng
 	  XPP055C272 controller for 720x1280 LCD panels with MIPI/RGB/SPI
 	  system interfaces.
+
+config DRM_PANEL_XIAOMI_P336020B
+	tristate "Xiaomi P336020B cmd mode dsc dsi panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  Say Y here if you want to enable support for the Xiaomi P336020B cmd mode dsc dsi panel.
+
+config DRM_PANEL_XIAOMI_N1142020A
+	tristate "Xiaomi N1142020A cmd mode dsc dsi panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	select DRM_KMS_HELPER
+	help
+	  Say Y here if you want to enable support for the Xiaomi N1142020A cmd mode dsc dsi panel.
+
+config DRM_PANEL_ONEPLUS_AA601
+	tristate "OnePlus AA601 P 7 A0020 DSC cmd mode AMOLED panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  Say Y here if you want to enable support for the OnePlus 15 Infiniti
+	  AA601 P 7 A0020 DSC command-mode AMOLED panel (1272x2772).
+	  The panel is 4-lane DSI, RGB101010, 2-slice DSC (8 bpp).
+
 endmenu
