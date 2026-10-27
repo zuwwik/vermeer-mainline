@@ -27,7 +27,7 @@
  */
 #define IPA_QMI_INDICATION_REGISTER_REQ_SZ	20	/* -> server handle */
 #define IPA_QMI_INDICATION_REGISTER_RSP_SZ	7	/* <- server handle */
-#define IPA_QMI_INIT_DRIVER_REQ_SZ		162	/* client handle -> */
+#define IPA_QMI_INIT_DRIVER_REQ_SZ		173	/* client handle -> */
 #define IPA_QMI_INIT_DRIVER_RSP_SZ		25	/* client handle <- */
 #define IPA_QMI_INIT_COMPLETE_IND_SZ		7	/* <- server handle */
 #define IPA_QMI_DRIVER_INIT_COMPLETE_REQ_SZ	4	/* -> server handle */
@@ -216,6 +216,8 @@ struct ipa_init_modem_driver_req {
 	u32			hw_stats_drop_base_addr;
 	u8			hw_stats_drop_size_valid;
 	u32			hw_stats_drop_size;
+	u8			smem_info_valid;
+	struct ipa_mem_range	smem_info;
 };
 
 /* The response to a IPA_QMI_INIT_DRIVER request begins with a standard

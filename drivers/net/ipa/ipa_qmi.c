@@ -327,6 +327,15 @@ init_modem_driver_req(struct ipa_qmi *ipa_qmi)
 		req.modem_mem_info.size = mem->size;
 	}
 
+	/* Firmware needs the allocation size, not the page-aligned IOMMU span.
+	 * This offset is relative to the SMEM item, not to IPA shared SRAM.
+	 */
+	if (ipa->smem_item_size) {
+		req.smem_info_valid = 1;
+		req.smem_info.start = 0;
+		req.smem_info.size = ipa->smem_item_size;
+	}
+
 	req.ctrl_comm_dest_end_pt_valid = 1;
 	req.ctrl_comm_dest_end_pt =
 		ipa->name_map[IPA_ENDPOINT_AP_MODEM_RX]->endpoint_id;

@@ -588,6 +588,7 @@ static int ipa_smem_init(struct ipa *ipa, size_t size)
 
 	ipa->smem_iova = iova;
 	ipa->smem_size = size;
+	ipa->smem_item_size = actual;
 
 	return 0;
 }
@@ -612,6 +613,7 @@ static void ipa_smem_exit(struct ipa *ipa)
 
 	ipa->smem_size = 0;
 	ipa->smem_iova = 0;
+	ipa->smem_item_size = 0;
 }
 
 /* Perform memory region-related initialization */
