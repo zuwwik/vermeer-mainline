@@ -10,6 +10,7 @@
 
 #include <linux/i2c.h>
 #include <linux/firmware.h>
+#include <linux/gpio/consumer.h>
 #include <linux/bitops.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
@@ -38,11 +39,12 @@ static void aw88261_dev_set_volume(struct aw_device *aw_dev, unsigned int value)
 
 static void aw88261_dev_i2s_tx_enable(struct aw_device *aw_dev, bool flag)
 {
+	/* I2STXEN is bit 6 of I2SCTRL3, not I2SCFG1. */
 	if (flag)
-		regmap_update_bits(aw_dev->regmap, AW88261_I2SCFG1_REG,
+		regmap_update_bits(aw_dev->regmap, AW88261_I2SCTRL3_REG,
 			~AW88261_I2STXEN_MASK, AW88261_I2STXEN_ENABLE_VALUE);
 	else
-		regmap_update_bits(aw_dev->regmap, AW88261_I2SCFG1_REG,
+		regmap_update_bits(aw_dev->regmap, AW88261_I2SCTRL3_REG,
 			~AW88261_I2STXEN_MASK, AW88261_I2STXEN_DISABLE_VALUE);
 }
 
@@ -127,7 +129,35 @@ static int aw88261_dev_check_pll(struct aw_device *aw_dev)
 static int aw88261_dev_configure_syspll(struct aw88261 *aw88261)
 {
 	struct aw_device *aw_dev = aw88261->aw_pa;
+	unsigned int i2sctrl1, i2sctrl2;
 	int ret;
+
+	/*
+	 * A board-specific ACF can describe TDM framing without an explicit
+	 * set_tdm_slot() call, as on Vermeer.  Keep its complete serial setup
+	 * rather than overwriting it with the driver's default I2S settings.
+	 * Explicit machine-driver slot configuration still takes precedence.
+	 */
+	if (!aw88261->tdm_configured) {
+		ret = regmap_read(aw_dev->regmap, AW88261_I2SCTRL2_REG, &i2sctrl2);
+		if (ret)
+			return ret;
+
+		if (i2sctrl2 & ~AW88261_SLOT_NUM_MASK) {
+			ret = regmap_read(aw_dev->regmap, AW88261_I2SCTRL1_REG, &i2sctrl1);
+			if (ret)
+				return ret;
+
+			if ((i2sctrl1 & ~AW88261_I2SSR_MASK) != aw88261->sr_value) {
+				dev_err(aw_dev->dev, "ACF TDM sample rate does not match PCM rate\n");
+				return -EINVAL;
+			}
+
+			dev_dbg(aw_dev->dev, "keeping ACF TDM framing: I2SCTRL1=%04x I2SCTRL2=%04x\n",
+				i2sctrl1, i2sctrl2);
+			return aw88261_dev_check_pll(aw_dev);
+		}
+	}
 
 	/* Configure TDM slots (I2S is represented as no slots) */
 	ret = regmap_update_bits(aw_dev->regmap, AW88261_I2SCTRL2_REG,
@@ -205,11 +235,11 @@ static int aw88261_dev_check_sysst(struct aw_device *aw_dev)
 		if (ret)
 			return ret;
 
-		check_val = reg_val & (~AW88261_BIT_SYSST_CHECK_MASK)
-							& AW88261_BIT_SYSST_CHECK;
-		if (check_val != AW88261_BIT_SYSST_CHECK) {
+		/* The muted amplifier need not be switching or boosting yet. */
+		check_val = reg_val & AW88261_BIT_PLL_CHECK;
+		if (check_val != AW88261_BIT_PLL_CHECK) {
 			dev_dbg(aw_dev->dev, "check sysst fail, reg_val=0x%04x, check:0x%x",
-				reg_val, AW88261_BIT_SYSST_CHECK);
+				reg_val, AW88261_BIT_PLL_CHECK);
 			usleep_range(AW88261_2000_US, AW88261_2000_US + 10);
 		} else {
 			return 0;
@@ -421,9 +451,6 @@ static int aw88261_dev_reg_update(struct aw88261 *aw88261,
 	if (ret)
 		return ret;
 
-	if (aw_dev->prof_cur != aw_dev->prof_index)
-		vol_desc->ctl_volume = 0;
-
 	/* keep min volume */
 	aw88261_dev_set_volume(aw_dev, vol_desc->mute_volume);
 
@@ -512,7 +539,7 @@ static int aw88261_dev_start(struct aw88261 *aw88261)
 
 	ret = aw88261_dev_configure_syspll(aw88261);
 	if (ret) {
-		dev_dbg(aw_dev->dev, "pll check failed");
+		dev_err(aw_dev->dev, "PLL did not lock; check BCLK/LRCLK framing (%d)\n", ret);
 		goto pll_check_fail;
 	}
 
@@ -523,7 +550,7 @@ static int aw88261_dev_start(struct aw88261 *aw88261)
 	/* check i2s status */
 	ret = aw88261_dev_check_sysst(aw_dev);
 	if (ret) {
-		dev_dbg(aw_dev->dev, "sysst check failed");
+		dev_err(aw_dev->dev, "invalid amplifier system status after PLL lock (%d)\n", ret);
 		goto sysst_check_fail;
 	}
 
@@ -562,7 +589,7 @@ pll_check_fail:
 static int aw88261_dev_stop(struct aw_device *aw_dev)
 {
 	if (aw_dev->status == AW88261_DEV_PW_OFF) {
-		dev_info(aw_dev->dev, "already power off");
+		dev_dbg(aw_dev->dev, "already power off");
 		return 0;
 	}
 
@@ -698,6 +725,7 @@ static int aw88261_hw_params(struct snd_pcm_substream *substream,
 {
 	struct snd_soc_component *component = dai->component;
 	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(component);
+	unsigned int serial_slot_width;
 
 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
 		return 0;
@@ -746,7 +774,12 @@ static int aw88261_hw_params(struct snd_pcm_substream *substream,
 		return -EINVAL;
 	}
 
-	switch (params_width(params)) {
+	/*
+	 * The PCM sample format need not equal the physical serializer slot width.
+	 * An explicit TDM configuration supplies its own serializer slot width.
+	 */
+	serial_slot_width = aw88261->serial_slot_width ?: params_width(params);
+	switch (serial_slot_width) {
 	case 16:
 		aw88261->fs_value = AW88261_I2SFS_16_BITS_VALUE;
 		break;
@@ -760,12 +793,14 @@ static int aw88261_hw_params(struct snd_pcm_substream *substream,
 		aw88261->fs_value = AW88261_I2SFS_32_BITS_VALUE;
 		break;
 	default:
-		dev_err(aw88261->aw_pa->dev, "unsupported bit width %d\n",
-			params_width(params));
+		dev_err(aw88261->aw_pa->dev, "unsupported serial slot width %d\n",
+			serial_slot_width);
 		return -EINVAL;
 	}
 
-	switch (params_physical_width(params)) {
+	serial_slot_width = aw88261->serial_slot_width ?:
+		params_physical_width(params);
+	switch (serial_slot_width) {
 	case 16:
 		aw88261->bck_value = AW88261_I2SBCK_32FS_VALUE;
 		break;
@@ -776,8 +811,8 @@ static int aw88261_hw_params(struct snd_pcm_substream *substream,
 		aw88261->bck_value = AW88261_I2SBCK_64FS_VALUE;
 		break;
 	default:
-		dev_err(aw88261->aw_pa->dev, "unsupported physical bit width %d\n",
-			params_physical_width(params));
+		dev_err(aw88261->aw_pa->dev, "unsupported serial slot width %d\n",
+			serial_slot_width);
 		return -EINVAL;
 	}
 
@@ -793,12 +828,18 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 
 	switch (slots) {
 	case 0:
-		/* Just reset everything TDM related to I2S values */
+		if (slot_width && slot_width != 16 && slot_width != 20 &&
+		    slot_width != 24 && slot_width != 32)
+			return -EINVAL;
+
+		/* Just reset everything TDM related to I2S values. */
 		aw88261->slot_num_value = AW88261_SLOT_NUM_I2S_MODE_VALUE;
 		aw88261->tdm_bck_value = AW88261_TDM_BCK_UNSET;
+		aw88261->serial_slot_width = slot_width;
 		aw88261->tx_slotvld_mask = 0 << AW88261_I2S_TX_SLOTVLD_START_BIT;
 		aw88261->rxl_slotvld_mask = 0 << AW88261_I2S_RXL_SLOTVLD_START_BIT;
 		aw88261->rxr_slotvld_mask = 1 << AW88261_I2S_RXR_SLOTVLD_START_BIT;
+		aw88261->tdm_configured = true;
 		return 0;
 	case 1:
 		aw88261->slot_num_value = AW88261_SLOT_NUM_TDM1S_VALUE;
@@ -839,6 +880,7 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 			slot_width);
 		return -EINVAL;
 	}
+	aw88261->serial_slot_width = slot_width;
 
 	if (tx_mask != 0) {
 		if ((chan = __ffs(tx_mask)) > 16)
@@ -861,6 +903,28 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 		aw88261->rxr_slotvld_mask = chan << AW88261_I2S_RXR_SLOTVLD_START_BIT;
 	}
 
+	aw88261->tdm_configured = true;
+
+	return 0;
+}
+
+static int aw88261_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+{
+	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(dai->component);
+	struct aw_device *aw_dev = aw88261->aw_pa;
+
+	mutex_lock(&aw88261->lock);
+	if (mute) {
+		if (aw_dev->status == AW88261_DEV_PW_ON)
+			aw88261_dev_mute(aw_dev, true);
+	} else if (aw_dev->status != AW88261_DEV_PW_ON) {
+		/* AudioReach only supplies the serial clocks after CPU DAI START. */
+		aw88261_start(aw88261);
+	} else if (!aw88261->mute_st) {
+		aw88261_dev_mute(aw_dev, false);
+	}
+	mutex_unlock(&aw88261->lock);
+
 	return 0;
 }
 
@@ -868,6 +932,9 @@ static const struct snd_soc_dai_ops aw88261_dai_ops = {
 	.set_fmt = aw88261_set_fmt,
 	.hw_params = aw88261_hw_params,
 	.set_tdm_slot = aw88261_set_tdm_slot,
+	.mute_stream = aw88261_mute_stream,
+	.mute_unmute_on_trigger = true,
+	.no_capture_mute = 1,
 };
 
 static struct snd_soc_dai_driver aw88261_dai[] = {
@@ -1040,9 +1107,6 @@ static int aw88261_playback_event(struct snd_soc_dapm_widget *w,
 
 	mutex_lock(&aw88261->lock);
 	switch (event) {
-	case SND_SOC_DAPM_PRE_PMU:
-		aw88261_start(aw88261);
-		break;
 	case SND_SOC_DAPM_POST_PMD:
 		aw88261_dev_stop(aw88261->aw_pa);
 		break;
@@ -1058,7 +1122,7 @@ static const struct snd_soc_dapm_widget aw88261_dapm_widgets[] = {
 	 /* playback */
 	SND_SOC_DAPM_AIF_IN_E("AIF_RX", "Speaker_Playback", 0, 0, 0, 0,
 					aw88261_playback_event,
-					SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+					SND_SOC_DAPM_POST_PMD),
 	SND_SOC_DAPM_OUTPUT("DAC Output"),
 
 	/* capture */
@@ -1252,6 +1316,19 @@ static int aw88261_init(struct aw88261 *aw88261, struct i2c_client *i2c, struct 
 	ret = devm_regulator_get_enable(&i2c->dev, "dvdd");
 	if (ret)
 		return dev_err_probe(&i2c->dev, ret, "Failed to enable dvdd supply\n");
+
+	aw88261->reset_gpio = devm_gpiod_get_optional(&i2c->dev, "reset",
+							 GPIOD_OUT_LOW);
+	if (IS_ERR(aw88261->reset_gpio))
+		return dev_err_probe(&i2c->dev, PTR_ERR(aw88261->reset_gpio),
+					     "Failed to get reset GPIO\n");
+
+	if (aw88261->reset_gpio) {
+		/* Vermeer holds AW88261 in reset until this low-high sequence. */
+		usleep_range(AW88261_1000_US, AW88261_1000_US + 100);
+		gpiod_set_value_cansleep(aw88261->reset_gpio, 1);
+		usleep_range(AW88261_2000_US, AW88261_2000_US + 100);
+	}
 
 	/* read chip id */
 	ret = regmap_read(regmap, AW88261_ID_REG, &chip_id);

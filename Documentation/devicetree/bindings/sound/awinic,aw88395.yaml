@@ -67,7 +67,6 @@ allOf:
             enum:
               - awinic,aw88081
               - awinic,aw88083
-              - awinic,aw88261
     then:
       properties:
         reset-gpios: false

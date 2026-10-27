@@ -606,6 +606,7 @@ struct aw88261 {
 	unsigned int bck_inv_value;
 	unsigned int tdm_bck_value;
 	unsigned int md_value;
+	unsigned int serial_slot_width;
 
 	unsigned int slot_num_value;
 	unsigned int tx_slotvld_mask;
@@ -613,6 +614,7 @@ struct aw88261 {
 	unsigned int rxr_slotvld_mask;
 
 	bool phase_sync;
+	bool tdm_configured;
 };
 
 #endif
