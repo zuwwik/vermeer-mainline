@@ -65,6 +65,8 @@ struct csiphy_lane_regs {
 	u32 csiphy_param_type;
 };
 
+#include "camss-csiphy-3ph-1-0-cphy.h"
+
 /* 5nm 2PH v 1.3.0 2p5Gbps 4 lane DPHY mode */
 static const struct
 csiphy_lane_regs lane_regs_sa8775p[] = {
@@ -1116,10 +1118,11 @@ static u8 csiphy_get_lane_mask(struct csiphy_lanes_cfg *lane_cfg)
 	u8 lane_mask;
 	int i;
 
-	lane_mask = CSIPHY_3PH_CMN_CSI_COMMON_CTRL5_CLK_ENABLE;
+	lane_mask = lane_cfg->cphy ? 0 : CSIPHY_3PH_CMN_CSI_COMMON_CTRL5_CLK_ENABLE;
 
 	for (i = 0; i < lane_cfg->num_data; i++)
-		lane_mask |= 1 << lane_cfg->data[i].pos;
+		lane_mask |= BIT(lane_cfg->cphy ?
+				2 * lane_cfg->data[i].pos + 1 : lane_cfg->data[i].pos);
 
 	return lane_mask;
 }
@@ -1148,6 +1151,50 @@ static bool csiphy_is_gen2(u32 version)
 	return ret;
 }
 
+static void csiphy_sm8550_cphy_enable(struct csiphy_device *csiphy, u8 lane_mask)
+{
+	const struct csiphy_lane_regs *r;
+	unsigned int i;
+
+	/* Keep the PHY in reset throughout programming, as in v2.1.2. */
+	writel_relaxed(1, csiphy->base + 0x1000);
+	usleep_range(1, 5);
+	writel_relaxed(lane_mask, csiphy->base + 0x1014);
+	writel_relaxed(0, csiphy->base + 0x1084);
+	writel_relaxed(0, csiphy->base + 0x108c);
+	usleep_range(1, 5);
+	writel_relaxed(0x7a, csiphy->base + 0x101c);
+	writel_relaxed(1, csiphy->base + 0x1018);
+	for (i = 0; i < ARRAY_SIZE(sm8550_cphy_rate_regs); i++) {
+		u32 value;
+
+		r = &sm8550_cphy_rate_regs[i];
+		value = r->reg_data;
+		/* Live Android config: settle_time=10000000000, divided by
+		 * 200000000 by the v2.1.2 driver, giving 50 for all three trios.
+		 */
+		if (r->csiphy_param_type == CSIPHY_SETTLE_CNT_LOWER_BYTE)
+			value = 50;
+		else if (r->csiphy_param_type == CSIPHY_SETTLE_CNT_HIGHER_BYTE)
+			value = 0;
+		writel_relaxed(value, csiphy->base + r->reg_addr);
+		if (r->delay_us)
+			usleep_range(r->delay_us, r->delay_us + 5);
+	}
+	for (i = 0; i < ARRAY_SIZE(sm8550_cphy_lane_regs); i++) {
+		r = &sm8550_cphy_lane_regs[i];
+		writel_relaxed(r->reg_data, csiphy->base + r->reg_addr);
+		if (r->delay_us)
+			usleep_range(r->delay_us, r->delay_us + 5);
+	}
+	/* Preserve CAMSS interrupt policy: all PHY IRQs are masked. */
+	for (i = 11; i < 22; i++)
+		writel_relaxed(0, csiphy->base + 0x1000 + 4 * i);
+	/* Publish the AFE/lane writes before releasing the receiver. */
+	writel(0x0e, csiphy->base + 0x1000);
+	usleep_range(3048, 3100);
+}
+
 static void csiphy_lanes_enable(struct csiphy_device *csiphy,
 				struct csiphy_config *cfg,
 				s64 link_freq, u8 lane_mask)
@@ -1158,6 +1205,10 @@ static void csiphy_lanes_enable(struct csiphy_device *csiphy,
 	u8 val;
 	int i;
 
+	if (c->cphy) {
+		csiphy_sm8550_cphy_enable(csiphy, lane_mask);
+		return;
+	}
 	settle_cnt = csiphy_settle_cnt_calc(link_freq, csiphy->timer_clk_rate);
 
 	val = CSIPHY_3PH_CMN_CSI_COMMON_CTRL5_CLK_ENABLE;

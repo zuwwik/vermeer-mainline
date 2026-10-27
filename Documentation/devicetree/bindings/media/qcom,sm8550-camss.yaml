@@ -312,8 +312,24 @@ properties:
                   - 4 # MEDIA_BUS_TYPE_CSI2_DPHY
 
             required:
-              - clock-lanes
               - data-lanes
+
+            allOf:
+              - if:
+                  properties:
+                    bus-type:
+                      const: 1
+                  required:
+                    - bus-type
+                then:
+                  properties:
+                    clock-lanes: false
+                    data-lanes:
+                      minItems: 3
+                      maxItems: 3
+                else:
+                  required:
+                    - clock-lanes
 
       port@6:
         $ref: /schemas/graph.yaml#/$defs/port-base

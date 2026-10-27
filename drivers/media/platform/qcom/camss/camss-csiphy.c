@@ -148,12 +148,20 @@ static int csiphy_set_clock_rates(struct csiphy_device *csiphy)
 	link_freq = camss_get_link_freq(&csiphy->subdev.entity, bpp, num_lanes);
 	if (link_freq < 0)
 		link_freq  = 0;
+	/* Initial C-PHY support uses the SM8550 2.6-2.8 Gsym/s AFE profile.
+	 * Reject other rates rather than silently applying the wrong profile.
+	 * LINK_FREQ is half the symbol rate, as specified by the CSI-2 API.
+	 */
+	if (csiphy->cfg.csi2->lane_cfg.cphy &&
+	    (link_freq <= 1300000000LL || link_freq > 1400000000LL))
+		return dev_err_probe(dev, -EINVAL, "unsupported C-PHY link frequency\n");
 
 	for (i = 0; i < csiphy->nclocks; i++) {
 		struct camss_clock *clock = &csiphy->clock[i];
 
 		if (csiphy->rate_set[i]) {
-			u64 min_rate = link_freq / 4;
+			u64 min_rate = csiphy->cfg.csi2->lane_cfg.cphy ?
+				link_freq / 7 : link_freq / 4;
 			long round_rate;
 
 			camss_add_clock_margin(&min_rate);
