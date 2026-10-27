@@ -5,12 +5,16 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/auxiliary_bus.h>
+#include <linux/bitops.h>
+#include <linux/debugfs.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
+#include <linux/seq_file.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/math.h>
@@ -38,6 +42,10 @@ enum qcom_battmgr_variant {
 #define NOTIF_BAT_STATUS		0x80
 #define NOTIF_BAT_INFO			0x81
 #define NOTIF_BAT_CHARGING_STATE	0x83
+#define NOTIF_XIAOMI_PROPERTY	0x50
+
+/* Match the stock Vermeer AP-side telemetry poll while awake. */
+#define XIAOMI_BATTMGR_POLL_INTERVAL	(10 * HZ)
 
 #define BATTMGR_BAT_INFO		0x9
 
@@ -99,6 +107,8 @@ enum qcom_battmgr_variant {
 #define WLS_BOOST_EN			6
 
 #define BATTMGR_CHG_CTRL_LIMIT_EN	0x48
+#define BATTMGR_XIAOMI_PROPERTY_GET	0x50
+#define VERMEER_THERMAL_TEMP		99
 #define CHARGE_CTRL_START_THR_MIN	50
 #define CHARGE_CTRL_START_THR_MAX	95
 #define CHARGE_CTRL_END_THR_MIN		55
@@ -323,8 +333,17 @@ struct qcom_battmgr {
 
 	int error;
 	struct completion ack;
+	unsigned int pending_opcode;
+	unsigned int pending_property;
+	u32 xiaomi_value;
+	struct dentry *debugfs_dir;
 
 	bool service_up;
+	bool stopping;
+	bool is_vermeer;
+	unsigned long bat_valid;
+	unsigned long usb_valid;
+	unsigned long wls_valid;
 
 	struct qcom_battmgr_info info;
 	struct qcom_battmgr_status status;
@@ -333,6 +352,7 @@ struct qcom_battmgr {
 	struct qcom_battmgr_wireless wireless;
 
 	struct work_struct enable_work;
+	struct delayed_work refresh_work;
 
 	/*
 	 * @lock is used to prevent concurrent power supply requests to the
@@ -343,22 +363,37 @@ struct qcom_battmgr {
 
 static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
 {
+	const struct qcom_battmgr_property_request *request = data;
+	const struct pmic_glink_hdr *hdr = data;
+	unsigned int opcode = le32_to_cpu(hdr->opcode);
 	unsigned long left;
 	int ret;
+
+	if (READ_ONCE(battmgr->stopping))
+		return -ENODEV;
 
 	reinit_completion(&battmgr->ack);
 
 	battmgr->error = 0;
+	if (opcode == BATTMGR_BAT_PROPERTY_GET ||
+	    opcode == BATTMGR_USB_PROPERTY_GET ||
+	    opcode == BATTMGR_WLS_PROPERTY_GET ||
+	    opcode == BATTMGR_XIAOMI_PROPERTY_GET)
+		WRITE_ONCE(battmgr->pending_property, le32_to_cpu(request->property));
+	smp_store_release(&battmgr->pending_opcode, opcode);
 
 	ret = pmic_glink_send(battmgr->client, data, len);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	left = wait_for_completion_timeout(&battmgr->ack, HZ);
-	if (!left)
-		return -ETIMEDOUT;
+	ret = left ? battmgr->error : -ETIMEDOUT;
+	if (ret > 0)
+		ret = -EREMOTEIO;
 
-	return battmgr->error;
+out:
+	smp_store_release(&battmgr->pending_opcode, 0);
+	return ret;
 }
 
 static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
@@ -375,6 +410,75 @@ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcod
 
 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
 }
+
+static int qcom_battmgr_refresh_property(struct qcom_battmgr *battmgr,
+					unsigned int opcode, unsigned int property,
+					unsigned long *valid)
+{
+	int ret;
+
+	mutex_lock(&battmgr->lock);
+	if (!READ_ONCE(battmgr->service_up))
+		ret = -EAGAIN;
+	else
+		ret = qcom_battmgr_request_property(battmgr, opcode, property, 0);
+
+	/*
+	 * Like the stock Vermeer driver, retain successfully read properties
+	 * while the ADSP transport recovers. Never return uninitialized data
+	 * or turn a firmware/protocol error into a successful property read.
+	 */
+	if (battmgr->is_vermeer) {
+		if (!ret)
+			__set_bit(property, valid);
+		else if (test_bit(property, valid) &&
+			 (ret == -EAGAIN || ret == -ECONNRESET ||
+			  ret == -ENOTCONN || ret == -ESHUTDOWN ||
+			  ret == -ETIMEDOUT || ret == -EIO))
+			ret = 0;
+	}
+	mutex_unlock(&battmgr->lock);
+
+	return ret;
+}
+
+/* Read-only diagnostic whitelist, verified against the stock Android module. */
+static int qcom_battmgr_xiaomi_gauge_show(struct seq_file *s, void *unused)
+{
+	static const struct {
+		unsigned int property;
+		const char *name;
+	} properties[] = {
+		{ 47, "soc_decimal" },
+		{ 54, "fg_raw_soc" },
+		{ VERMEER_THERMAL_TEMP, "thermal_temp" },
+		{ 138, "fg1_rm" },
+		{ 139, "fg1_fcc" },
+		{ 142, "fg1_cycle" },
+		{ 150, "fg1_rsoc" },
+	};
+	struct qcom_battmgr *battmgr = s->private;
+	unsigned int i;
+	int ret;
+
+	mutex_lock(&battmgr->lock);
+	if (!READ_ONCE(battmgr->service_up) || READ_ONCE(battmgr->stopping)) {
+		mutex_unlock(&battmgr->lock);
+		return -EAGAIN;
+	}
+	for (i = 0; i < ARRAY_SIZE(properties); i++) {
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_XIAOMI_PROPERTY_GET,
+						  properties[i].property, 0);
+		if (ret)
+			seq_printf(s, "%s error=%d\n", properties[i].name, ret);
+		else
+			seq_printf(s, "%s=%d\n", properties[i].name, (s32)battmgr->xiaomi_value);
+	}
+	mutex_unlock(&battmgr->lock);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(qcom_battmgr_xiaomi_gauge);
 
 static int qcom_battmgr_update_status(struct qcom_battmgr *battmgr)
 {
@@ -452,22 +556,29 @@ static const u8 sm8350_bat_prop_map[] = {
 	[POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD] = BATT_CHG_CTRL_END_THR,
 };
 
+static unsigned int qcom_battmgr_bat_property_to_wire(struct qcom_battmgr *battmgr,
+						    unsigned int property)
+{
+	/* Xiaomi inserts CONSTANT_CURRENT at wire ID 12, before TEMP. */
+	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 && property >= BATT_TEMP)
+		return property + 1;
+
+	return property;
+}
+
 static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
 					  enum power_supply_property psp)
 {
 	unsigned int prop;
-	int ret;
 
 	if (psp >= ARRAY_SIZE(sm8350_bat_prop_map))
 		return -EINVAL;
 
 	prop = sm8350_bat_prop_map[psp];
+	prop = qcom_battmgr_bat_property_to_wire(battmgr, prop);
 
-	mutex_lock(&battmgr->lock);
-	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, prop, 0);
-	mutex_unlock(&battmgr->lock);
-
-	return ret;
+	return qcom_battmgr_refresh_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+					     prop, &battmgr->bat_valid);
 }
 
 static int qcom_battmgr_bat_sc8280xp_update(struct qcom_battmgr *battmgr,
@@ -517,7 +628,7 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	enum qcom_battmgr_unit unit = battmgr->unit;
 	int ret;
 
-	if (!battmgr->service_up)
+	if (!READ_ONCE(battmgr->service_up) && !battmgr->is_vermeer)
 		return -EAGAIN;
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
@@ -984,18 +1095,14 @@ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
 					  enum power_supply_property psp)
 {
 	unsigned int prop;
-	int ret;
 
 	if (psp >= ARRAY_SIZE(sm8350_usb_prop_map))
 		return -EINVAL;
 
 	prop = sm8350_usb_prop_map[psp];
 
-	mutex_lock(&battmgr->lock);
-	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, prop, 0);
-	mutex_unlock(&battmgr->lock);
-
-	return ret;
+	return qcom_battmgr_refresh_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+					     prop, &battmgr->usb_valid);
 }
 
 static int qcom_battmgr_usb_get_property(struct power_supply *psy,
@@ -1005,7 +1112,7 @@ static int qcom_battmgr_usb_get_property(struct power_supply *psy,
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 	int ret;
 
-	if (!battmgr->service_up)
+	if (!READ_ONCE(battmgr->service_up) && !battmgr->is_vermeer)
 		return -EAGAIN;
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
@@ -1107,18 +1214,14 @@ static int qcom_battmgr_wls_sm8350_update(struct qcom_battmgr *battmgr,
 					  enum power_supply_property psp)
 {
 	unsigned int prop;
-	int ret;
 
 	if (psp >= ARRAY_SIZE(sm8350_wls_prop_map))
 		return -EINVAL;
 
 	prop = sm8350_wls_prop_map[psp];
 
-	mutex_lock(&battmgr->lock);
-	ret = qcom_battmgr_request_property(battmgr, BATTMGR_WLS_PROPERTY_GET, prop, 0);
-	mutex_unlock(&battmgr->lock);
-
-	return ret;
+	return qcom_battmgr_refresh_property(battmgr, BATTMGR_WLS_PROPERTY_GET,
+					     prop, &battmgr->wls_valid);
 }
 
 static int qcom_battmgr_wls_get_property(struct power_supply *psy,
@@ -1128,7 +1231,7 @@ static int qcom_battmgr_wls_get_property(struct power_supply *psy,
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 	int ret;
 
-	if (!battmgr->service_up)
+	if (!READ_ONCE(battmgr->service_up) && !battmgr->is_vermeer)
 		return -EAGAIN;
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
@@ -1215,9 +1318,17 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 		break;
 	case NOTIF_USB_PROPERTY:
 		power_supply_changed(battmgr->usb_psy);
+		if (battmgr->variant == XIAOMI_BATTMGR_SM8550)
+			power_supply_changed(battmgr->bat_psy);
 		break;
 	case NOTIF_WLS_PROPERTY:
 		power_supply_changed(battmgr->wls_psy);
+		break;
+	case NOTIF_XIAOMI_PROPERTY:
+		if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
+			power_supply_changed(battmgr->bat_psy);
+			power_supply_changed(battmgr->usb_psy);
+		}
 		break;
 	default:
 		if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
@@ -1374,7 +1485,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 	unsigned int property;
 	unsigned int opcode = le32_to_cpu(resp->hdr.opcode);
 	size_t payload_len = len - sizeof(struct pmic_glink_hdr);
-	unsigned int val;
+	int val;
 
 	if (payload_len < sizeof(__le32)) {
 		dev_warn(battmgr->dev, "invalid payload length for %#x: %zd\n",
@@ -1386,11 +1497,10 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 	case BATTMGR_BAT_PROPERTY_GET:
 		property = le32_to_cpu(resp->intval.property);
 		if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
-			/* Xiaomi added BATT_CONSTANT_CURRENT after BATT_CHG_CTRL_LIM_MAX according
-			 * to their code, but it also seems that two properties got removed?
-			 * Fix properties after BATT_CHG_CTRL_LIM_MAX by decreasing property by 1
+			/* Normalize the same insertion used by outgoing requests.
+			 * TEMP through POWER_AVG are shifted by one on the wire.
 			 */
-			if(property > BATT_CHG_CTRL_LIM_MAX)
+			if (property > BATT_CHG_CTRL_LIM_MAX)
 				property--;
 		}
 		if (property == BATT_MODEL_NAME) {
@@ -1399,7 +1509,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 					 "invalid payload length for BATT_MODEL_NAME request: %zd\n",
 					 payload_len);
 				battmgr->error = -ENODATA;
-				return;
+				goto out_complete;
 			}
 		} else {
 			if (payload_len != sizeof(resp->intval)) {
@@ -1407,7 +1517,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 					 "invalid payload length for %#x request: %zd\n",
 					 property, payload_len);
 				battmgr->error = -ENODATA;
-				return;
+				goto out_complete;
 			}
 
 			battmgr->error = le32_to_cpu(resp->intval.result);
@@ -1429,7 +1539,15 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->info.charge_type = le32_to_cpu(resp->intval.value);
 			break;
 		case BATT_CAPACITY:
-			battmgr->status.percent = le32_to_cpu(resp->intval.value) / 100;
+			if (battmgr->is_vermeer && le32_to_cpu(resp->intval.value) > 10000) {
+				battmgr->error = -ENODATA;
+				goto out_complete;
+			}
+			val = le32_to_cpu(resp->intval.value);
+			if (battmgr->variant == XIAOMI_BATTMGR_SM8550)
+				battmgr->status.percent = DIV_ROUND_CLOSEST(val, 100);
+			else
+				battmgr->status.percent = val / 100;
 			break;
 		case BATT_SOH:
 			battmgr->status.soh_percent = le32_to_cpu(resp->intval.value);
@@ -1450,7 +1568,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 				battmgr->status.current_now = le32_to_cpu(resp->intval.value);
 			break;
 		case BATT_TEMP:
-			val = le32_to_cpu(resp->intval.value);
+			val = (s32)le32_to_cpu(resp->intval.value);
 			battmgr->status.temperature = DIV_ROUND_CLOSEST(val, 10);
 			break;
 		case BATT_TECHNOLOGY:
@@ -1502,7 +1620,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 				 "invalid payload length for %#x request: %zd\n",
 				 property, payload_len);
 			battmgr->error = -ENODATA;
-			return;
+			goto out_complete;
 		}
 
 		battmgr->error = le32_to_cpu(resp->intval.result);
@@ -1543,7 +1661,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 				 "invalid payload length for %#x request: %zd\n",
 				 property, payload_len);
 			battmgr->error = -ENODATA;
-			return;
+			goto out_complete;
 		}
 
 		battmgr->error = le32_to_cpu(resp->intval.result);
@@ -1571,6 +1689,15 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			break;
 		}
 		break;
+	case BATTMGR_XIAOMI_PROPERTY_GET:
+		if (payload_len != sizeof(resp->intval)) {
+			battmgr->error = -ENODATA;
+			goto out_complete;
+		}
+		battmgr->error = le32_to_cpu(resp->intval.result);
+		if (!battmgr->error)
+			battmgr->xiaomi_value = le32_to_cpu(resp->intval.value);
+		break;
 	case BATTMGR_REQUEST_NOTIFICATION:
 	case BATTMGR_CHG_CTRL_LIMIT_EN:
 		battmgr->error = 0;
@@ -1589,11 +1716,36 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 {
 	const struct pmic_glink_hdr *hdr = data;
 	struct qcom_battmgr *battmgr = priv;
-	unsigned int opcode = le32_to_cpu(hdr->opcode);
+	unsigned int opcode;
 
-	if (opcode == BATTMGR_NOTIFICATION)
+	if (len < sizeof(*hdr) || READ_ONCE(battmgr->stopping))
+		return;
+	opcode = le32_to_cpu(hdr->opcode);
+
+	if (opcode == BATTMGR_NOTIFICATION) {
 		qcom_battmgr_notification(battmgr, data, len);
-	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+		return;
+	}
+
+	/* Unsolicited vendor messages must not acknowledge another request. */
+	if (opcode != smp_load_acquire(&battmgr->pending_opcode))
+		return;
+	if (opcode == BATTMGR_BAT_PROPERTY_GET ||
+	    opcode == BATTMGR_USB_PROPERTY_GET ||
+	    opcode == BATTMGR_WLS_PROPERTY_GET ||
+	    opcode == BATTMGR_XIAOMI_PROPERTY_GET) {
+		const struct qcom_battmgr_message *resp = data;
+
+		if (len < sizeof(*hdr) + sizeof(__le32)) {
+			battmgr->error = -ENODATA;
+			complete(&battmgr->ack);
+			return;
+		}
+		if (le32_to_cpu(resp->intval.property) != READ_ONCE(battmgr->pending_property))
+			return;
+	}
+
+	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
 		 battmgr->variant == QCOM_BATTMGR_X1E80100)
 		qcom_battmgr_sc8280xp_callback(battmgr, data, len);
 	else
@@ -1610,20 +1762,63 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	};
 	int ret;
 
+	mutex_lock(&battmgr->lock);
+	if (!READ_ONCE(battmgr->service_up) || READ_ONCE(battmgr->stopping)) {
+		mutex_unlock(&battmgr->lock);
+		return;
+	}
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+	mutex_unlock(&battmgr->lock);
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
+}
+
+static void qcom_battmgr_refresh_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
+						 struct qcom_battmgr, refresh_work);
+
+	mutex_lock(&battmgr->lock);
+	if (!READ_ONCE(battmgr->service_up) || READ_ONCE(battmgr->stopping)) {
+		mutex_unlock(&battmgr->lock);
+		return;
+	}
+
+	/*
+	 * The stock AP polls both CAPACITY and Xiaomi THERMAL_TEMP even with
+	 * USB unplugged. A notification alone does not refresh these firmware
+	 * caches reliably. Keep the ordinary, firmware-smoothed SOC; do not
+	 * substitute raw gauge SOC or estimate a percentage from voltage.
+	 */
+	qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY, 0);
+	qcom_battmgr_request_property(battmgr, BATTMGR_XIAOMI_PROPERTY_GET,
+				     VERMEER_THERMAL_TEMP, 0);
+	mutex_unlock(&battmgr->lock);
+
+	power_supply_changed(battmgr->bat_psy);
+	power_supply_changed(battmgr->usb_psy);
+	queue_delayed_work(system_freezable_wq, &battmgr->refresh_work,
+			   XIAOMI_BATTMGR_POLL_INTERVAL);
 }
 
 static void qcom_battmgr_pdr_notify(void *priv, int state)
 {
 	struct qcom_battmgr *battmgr = priv;
 
+	if (READ_ONCE(battmgr->stopping))
+		return;
+
 	if (state == SERVREG_SERVICE_STATE_UP) {
-		battmgr->service_up = true;
+		WRITE_ONCE(battmgr->service_up, true);
 		schedule_work(&battmgr->enable_work);
+		if (battmgr->is_vermeer)
+			mod_delayed_work(system_freezable_wq, &battmgr->refresh_work,
+					 XIAOMI_BATTMGR_POLL_INTERVAL);
 	} else {
-		battmgr->service_up = false;
+		if (battmgr->is_vermeer && READ_ONCE(battmgr->service_up))
+			dev_warn(battmgr->dev, "charger service lost; retaining cached readings\n");
+		WRITE_ONCE(battmgr->service_up, false);
+		cancel_delayed_work(&battmgr->refresh_work);
 	}
 }
 
@@ -1667,6 +1862,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.num_supplicants = 1;
 
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
+	INIT_DELAYED_WORK(&battmgr->refresh_work, qcom_battmgr_refresh_worker);
 	mutex_init(&battmgr->lock);
 	init_completion(&battmgr->ack);
 
@@ -1675,6 +1871,13 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		battmgr->variant = (unsigned long)match->data;
 	else
 		battmgr->variant = QCOM_BATTMGR_SM8350;
+
+	/* Vermeer initially shipped a generic SM8550 node in this port. */
+	battmgr->is_vermeer = of_machine_is_compatible("xiaomi,vermeer");
+	if (battmgr->is_vermeer)
+		battmgr->variant = XIAOMI_BATTMGR_SM8550;
+
+	auxiliary_set_drvdata(adev, battmgr);
 
 	ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
 	if (ret < 0)
@@ -1708,8 +1911,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
 					     "failed to register wireless charing power supply\n");
 	} else {
-		if (battmgr->variant == QCOM_BATTMGR_SM8550 ||
-		    battmgr->variant == XIAOMI_BATTMGR_SM8550)
+		/* Xiaomi does not implement the SM8550 threshold-setting API. */
+		if (battmgr->variant == QCOM_BATTMGR_SM8550)
 			psy_desc = &sm8550_bat_psy_desc;
 		else
 			psy_desc = &sm8350_bat_psy_desc;
@@ -1738,8 +1941,27 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		return PTR_ERR(battmgr->client);
 
 	pmic_glink_client_register(battmgr->client);
+	if (battmgr->is_vermeer) {
+		battmgr->debugfs_dir = debugfs_create_dir(dev_name(dev), NULL);
+		debugfs_create_file("xiaomi_gauge", 0400, battmgr->debugfs_dir,
+				    battmgr, &qcom_battmgr_xiaomi_gauge_fops);
+	}
 
 	return 0;
+}
+
+static void qcom_battmgr_remove(struct auxiliary_device *adev)
+{
+	struct qcom_battmgr *battmgr = auxiliary_get_drvdata(adev);
+
+	WRITE_ONCE(battmgr->stopping, true);
+	WRITE_ONCE(battmgr->service_up, false);
+	debugfs_remove_recursive(battmgr->debugfs_dir);
+	cancel_delayed_work_sync(&battmgr->refresh_work);
+	cancel_work_sync(&battmgr->enable_work);
+	/* Drain a property request that passed service_up before teardown. */
+	mutex_lock(&battmgr->lock);
+	mutex_unlock(&battmgr->lock);
 }
 
 static const struct auxiliary_device_id qcom_battmgr_id_table[] = {
@@ -1751,6 +1973,7 @@ MODULE_DEVICE_TABLE(auxiliary, qcom_battmgr_id_table);
 static struct auxiliary_driver qcom_battmgr_driver = {
 	.name = "pmic_glink_power_supply",
 	.probe = qcom_battmgr_probe,
+	.remove = qcom_battmgr_remove,
 	.id_table = qcom_battmgr_id_table,
 };
 
