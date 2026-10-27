@@ -11,6 +11,7 @@
 #include <linux/irqchip.h>
 #include <linux/irqdesc.h>
 #include <linux/irqchip/chained_irq.h>
+#include <linux/module.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -23,6 +24,19 @@
 #include <generated/mdss.xml.h>
 
 #define MIN_IB_BW	400000000UL /* Min ib vote 400MB */
+
+static bool msm_mdss_skip_reset;
+module_param_named(skip_mdss_reset, msm_mdss_skip_reset, bool, 0644);
+MODULE_PARM_DESC(skip_mdss_reset,
+		 "Skip MDSS core reset on probe (UEFI continuous splash handoff)");
+
+static bool msm_mdss_should_skip_reset(struct device *dev)
+{
+	if (msm_mdss_skip_reset)
+		return true;
+
+	return device_property_read_bool(dev, "qcom,skip-mdss-reset");
+}
 
 struct msm_mdss_data {
 	u32 reg_bus_bw;
@@ -369,7 +383,12 @@ static struct msm_mdss *msm_mdss_init(struct platform_device *pdev, bool is_mdp5
 	int ret;
 	int irq;
 
-	ret = msm_mdss_reset(&pdev->dev);
+	ret = 0;
+	if (msm_mdss_should_skip_reset(&pdev->dev))
+		dev_info(&pdev->dev, "skipping MDSS reset for continuous splash handoff\n");
+	else if (!of_device_is_compatible(pdev->dev.of_node, "qcom,sm8550-mdss"))
+		ret = msm_mdss_reset(&pdev->dev);
+	/* SM8550 is reset in mdss_probe() after enabling the MDSS clocks. */
 	if (ret)
 		return ERR_PTR(ret);
 
@@ -480,6 +499,26 @@ static int mdss_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, mdss);
 
 	/*
+	 * On SM8550 the core reset must be applied with MDSS clocks enabled
+	 * to clear the bootloader's state in the DSI command DMA path. Reset
+	 * before creating children so the first panel initialization can use
+	 * command DMA, without waiting for a later MDSS power collapse.
+	 */
+	if (of_device_is_compatible(dev->of_node, "qcom,sm8550-mdss") &&
+	    !msm_mdss_should_skip_reset(dev)) {
+		ret = pm_runtime_resume_and_get(dev);
+		if (ret < 0)
+			goto err_destroy;
+
+		ret = msm_mdss_reset(dev);
+		pm_runtime_put_sync_suspend(dev);
+		if (ret)
+			goto err_destroy;
+
+		dev_info(dev, "reset MDSS with clocks enabled\n");
+	}
+
+	/*
 	 * MDP5/DPU based devices don't have a flat hierarchy. There is a top
 	 * level parent: MDSS, and children: MDP5/DPU, DSI, HDMI, eDP etc.
 	 * Populate the children devices, find the MDP5/DPU node, and then add
@@ -493,6 +532,10 @@ static int mdss_probe(struct platform_device *pdev)
 	}
 
 	return 0;
+
+err_destroy:
+	msm_mdss_destroy(mdss);
+	return dev_err_probe(dev, ret, "clocked MDSS reset failed\n");
 }
 
 static void mdss_remove(struct platform_device *pdev)

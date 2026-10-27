@@ -97,6 +97,8 @@ struct dsi_pll_7nm {
 	spinlock_t pll_enable_lock;
 	int pll_enable_cnt;
 
+		bool vco_configured;
+
 	struct pll_7nm_cached_state cached_state;
 
 	struct dsi_pll_7nm *slave;
@@ -112,6 +114,8 @@ static struct dsi_pll_7nm *pll_7nm_list[DSI_MAX];
 
 static void dsi_pll_enable_pll_bias(struct dsi_pll_7nm *pll);
 static void dsi_pll_disable_pll_bias(struct dsi_pll_7nm *pll);
+static int dsi_phy_hw_v4_0_is_pll_on(struct msm_dsi_phy *phy);
+static void dsi_7nm_phy_disable(struct msm_dsi_phy *phy);
 
 static void dsi_pll_setup_config(struct dsi_pll_config *config)
 {
@@ -344,6 +348,8 @@ static void dsi_pll_commit(struct dsi_pll_7nm *pll, struct dsi_pll_config *confi
 	       base + REG_DSI_7nm_PHY_PLL_CLOCK_INVERTERS_1);
 }
 
+static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw);
+
 static int dsi_pll_7nm_vco_set_rate(struct clk_hw *hw, unsigned long rate,
 				     unsigned long parent_rate)
 {
@@ -371,6 +377,17 @@ static int dsi_pll_7nm_vco_set_rate(struct clk_hw *hw, unsigned long rate,
 	dsi_pll_disable_pll_bias(pll_7nm);
 	/* flush, ensure all register writes are done*/
 	wmb();
+
+	pll_7nm->vco_configured = true;
+
+	if (clk_hw_is_prepared(hw) && !pll_7nm->phy->pll_on) {
+		int ret = dsi_pll_7nm_vco_prepare(hw);
+		if (ret) {
+			DRM_DEV_ERROR(&pll_7nm->phy->pdev->dev,
+				      "failed to prepare PLL after set_rate: %d\n", ret);
+			return ret;
+		}
+	}
 
 	return 0;
 }
@@ -491,14 +508,21 @@ static void dsi_pll_phy_dig_reset(struct dsi_pll_7nm *pll)
 static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 {
 	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(hw);
+	struct msm_dsi_phy *phy = pll_7nm->phy;
 	int rc;
+
+	if (unlikely(phy->pll_on))
+		return 0;
+
+	if (!pll_7nm->vco_configured)
+		return 0;
 
 	dsi_pll_enable_pll_bias(pll_7nm);
 	if (pll_7nm->slave)
 		dsi_pll_enable_pll_bias(pll_7nm->slave);
 
 	/* Start PLL */
-	writel(BIT(0), pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
+	writel(BIT(0), phy->base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
 
 	/*
 	 * ensure all PLL configurations are written prior to checking
@@ -509,11 +533,11 @@ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 	/* Check for PLL lock */
 	rc = dsi_pll_7nm_lock_status(pll_7nm);
 	if (rc) {
-		pr_err("PLL(%d) lock failed\n", pll_7nm->phy->id);
+		pr_err("PLL(%d) lock failed\n", phy->id);
 		goto error;
 	}
 
-	pll_7nm->phy->pll_on = true;
+	phy->pll_on = true;
 
 	/*
 	 * assert power on reset for PHY digital in case the PLL is
@@ -545,6 +569,9 @@ static void dsi_pll_disable_sub(struct dsi_pll_7nm *pll)
 static void dsi_pll_7nm_vco_unprepare(struct clk_hw *hw)
 {
 	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(hw);
+
+	if (!pll_7nm->phy->pll_on && !dsi_phy_hw_v4_0_is_pll_on(pll_7nm->phy))
+		return;
 
 	/*
 	 * To avoid any stray glitches while abruptly powering down the PLL
@@ -890,6 +917,12 @@ static int dsi_pll_7nm_init(struct msm_dsi_phy *phy)
 	 */
 	if (!dsi_pll_7nm_vco_recalc_rate(&pll_7nm->clk_hw, VCO_REF_CLK_RATE))
 		pll_7nm->vco_current_rate = pll_7nm->phy->cfg->min_pll_rate;
+
+	if (dsi_phy_hw_v4_0_is_pll_on(phy)) {
+		pr_info("DSI PLL%d: Bootloader left PLL running, shutting down\n", phy->id);
+		dsi_pll_7nm_vco_unprepare(&pll_7nm->clk_hw);
+		dsi_7nm_phy_disable(phy);
+	}
 
 	return 0;
 }
