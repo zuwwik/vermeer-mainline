@@ -225,6 +225,17 @@ config INPUT_PM8XXX_VIBRATOR
 	  To compile this driver as module, choose M here: the
 	  module will be called pm8xxx-vibrator.
 
+config INPUT_QCOM_PM8550B_HAPTICS
+	tristate "Qualcomm PM8550B haptics support"
+	depends on OF && MFD_SPMI_PMIC
+	help
+	  Support the HAP525_HV haptics engine in Qualcomm PM8550B PMICs.
+	  Provides rumble, constant force, gain control and custom FIFO
+	  waveforms through the input force-feedback interface.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called qcom-pm8550b-haptics.
+
 config INPUT_PMIC8XXX_PWRKEY
 	tristate "PMIC8XXX power key support"
 	depends on MFD_PM8XXX

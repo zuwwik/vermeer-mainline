@@ -205,6 +205,10 @@ patternProperties:
     type: object
     $ref: /schemas/regulator/qcom,usb-vbus-regulator.yaml#
 
+  "^haptics@[0-9a-f]+$":
+    type: object
+    $ref: /schemas/input/qcom,pm8550b-haptics.yaml#
+
   "^vibrator@[0-9a-f]+$":
     type: object
     $ref: /schemas/input/qcom,pm8xxx-vib.yaml#
