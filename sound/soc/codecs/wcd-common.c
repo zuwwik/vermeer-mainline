@@ -127,12 +127,26 @@ int wcd_interrupt_callback(struct sdw_slave *slave, struct irq_domain *slave_irq
 {
 	struct regmap *regmap = dev_get_regmap(&slave->dev, NULL);
 	u32 sts1, sts2, sts3;
+	unsigned int irq;
+	int ret;
+
+	if (!slave_irq)
+		return IRQ_NONE;
+	irq = irq_find_mapping(slave_irq, 0);
+	if (!irq)
+		return IRQ_NONE;
 
 	do {
-		handle_nested_irq(irq_find_mapping(slave_irq, 0));
-		regmap_read(regmap, wcd_intr_status0, &sts1);
-		regmap_read(regmap, wcd_intr_status1, &sts2);
-		regmap_read(regmap, wcd_intr_status2, &sts3);
+		handle_nested_irq(irq);
+		ret = regmap_read(regmap, wcd_intr_status0, &sts1);
+		if (ret)
+			return IRQ_NONE;
+		ret = regmap_read(regmap, wcd_intr_status1, &sts2);
+		if (ret)
+			return IRQ_NONE;
+		ret = regmap_read(regmap, wcd_intr_status2, &sts3);
+		if (ret)
+			return IRQ_NONE;
 
 	} while (sts1 || sts2 || sts3);
 

@@ -3935,11 +3935,15 @@ static void rx_macro_remove(struct platform_device *pdev)
 {
 	struct rx_macro *rx = dev_get_drvdata(&pdev->dev);
 
-	clk_disable_unprepare(rx->mclk);
-	clk_disable_unprepare(rx->npl);
-	clk_disable_unprepare(rx->fsgen);
-	clk_disable_unprepare(rx->macro);
+	pm_runtime_disable(&pdev->dev);
+	if (!pm_runtime_status_suspended(&pdev->dev)) {
+		clk_disable_unprepare(rx->fsgen);
+		clk_disable_unprepare(rx->npl);
+		clk_disable_unprepare(rx->mclk);
+	}
+	pm_runtime_set_suspended(&pdev->dev);
 	clk_disable_unprepare(rx->dcodec);
+	clk_disable_unprepare(rx->macro);
 }
 
 static const struct of_device_id rx_macro_dt_match[] = {

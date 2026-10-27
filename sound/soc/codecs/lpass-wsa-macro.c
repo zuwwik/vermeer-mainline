@@ -2656,7 +2656,7 @@ static int wsa_macro_register_mclk_output(struct wsa_macro *wsa)
 	init.num_parents = 1;
 	wsa->hw.init = &init;
 	hw = &wsa->hw;
-	ret = clk_hw_register(wsa->dev, hw);
+	ret = devm_clk_hw_register(wsa->dev, hw);
 	if (ret)
 		return ret;
 
@@ -2842,11 +2842,15 @@ static void wsa_macro_remove(struct platform_device *pdev)
 {
 	struct wsa_macro *wsa = dev_get_drvdata(&pdev->dev);
 
-	clk_disable_unprepare(wsa->macro);
+	pm_runtime_disable(&pdev->dev);
+	if (!pm_runtime_status_suspended(&pdev->dev)) {
+		clk_disable_unprepare(wsa->fsgen);
+		clk_disable_unprepare(wsa->npl);
+		clk_disable_unprepare(wsa->mclk);
+	}
+	pm_runtime_set_suspended(&pdev->dev);
 	clk_disable_unprepare(wsa->dcodec);
-	clk_disable_unprepare(wsa->mclk);
-	clk_disable_unprepare(wsa->npl);
-	clk_disable_unprepare(wsa->fsgen);
+	clk_disable_unprepare(wsa->macro);
 }
 
 static int wsa_macro_runtime_suspend(struct device *dev)

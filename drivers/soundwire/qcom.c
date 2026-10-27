@@ -693,18 +693,18 @@ static irqreturn_t qcom_swrm_wake_irq_handler(int irq, void *dev_id)
 	struct qcom_swrm_ctrl *ctrl = dev_id;
 	int ret;
 
+	/* This level IRQ is ours even while ADSP clock suppliers are down. */
+	if (ctrl->wake_irq > 0 &&
+	    !irqd_irq_disabled(irq_get_irq_data(ctrl->wake_irq)))
+		disable_irq_nosync(ctrl->wake_irq);
+
 	ret = pm_runtime_get_sync(ctrl->dev);
 	if (ret < 0 && ret != -EACCES) {
 		dev_err_ratelimited(ctrl->dev,
 				    "pm_runtime_get_sync failed in %s, ret %d\n",
 				    __func__, ret);
 		pm_runtime_put_noidle(ctrl->dev);
-		return ret;
-	}
-
-	if (ctrl->wake_irq > 0) {
-		if (!irqd_irq_disabled(irq_get_irq_data(ctrl->wake_irq)))
-			disable_irq_nosync(ctrl->wake_irq);
+		return IRQ_HANDLED;
 	}
 
 	pm_runtime_mark_last_busy(ctrl->dev);
@@ -1626,7 +1626,6 @@ static int qcom_swrm_probe(struct platform_device *pdev)
 
 	ret = devm_request_threaded_irq(dev, ctrl->irq, NULL,
 					qcom_swrm_irq_handler,
-					IRQF_TRIGGER_RISING |
 					IRQF_ONESHOT,
 					"soundwire", ctrl);
 	if (ret) {
@@ -1697,8 +1696,16 @@ static void qcom_swrm_remove(struct platform_device *pdev)
 {
 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(&pdev->dev);
 
+	/* Stop IRQ threads before removing their bus/IRQ-domain state. */
+	disable_irq(ctrl->irq);
+	if (ctrl->wake_irq > 0 &&
+	    !irqd_irq_disabled(irq_get_irq_data(ctrl->wake_irq)))
+		disable_irq(ctrl->wake_irq);
+	pm_runtime_disable(&pdev->dev);
 	sdw_bus_master_delete(&ctrl->bus);
-	clk_disable_unprepare(ctrl->hclk);
+	if (!pm_runtime_status_suspended(&pdev->dev))
+		clk_disable_unprepare(ctrl->hclk);
+	pm_runtime_set_suspended(&pdev->dev);
 }
 
 static int __maybe_unused swrm_runtime_resume(struct device *dev)

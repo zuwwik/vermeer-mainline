@@ -1703,10 +1703,13 @@ static void va_macro_remove(struct platform_device *pdev)
 {
 	struct va_macro *va = dev_get_drvdata(&pdev->dev);
 
-	if (va->has_npl_clk)
-		clk_disable_unprepare(va->npl);
-
-	clk_disable_unprepare(va->mclk);
+	pm_runtime_disable(&pdev->dev);
+	if (!pm_runtime_status_suspended(&pdev->dev)) {
+		if (va->has_npl_clk)
+			clk_disable_unprepare(va->npl);
+		clk_disable_unprepare(va->mclk);
+	}
+	pm_runtime_set_suspended(&pdev->dev);
 	clk_disable_unprepare(va->dcodec);
 	clk_disable_unprepare(va->macro);
 

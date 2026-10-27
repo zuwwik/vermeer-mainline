@@ -3003,6 +3003,8 @@ static const struct irq_domain_ops wcd_domain_ops = {
 
 static int wcd938x_irq_init(struct wcd938x_priv *wcd, struct device *dev)
 {
+	unsigned int irq;
+	int ret;
 
 	wcd->virq = irq_domain_create_linear(NULL, 1, &wcd_domain_ops, NULL);
 	if (!(wcd->virq)) {
@@ -3010,10 +3012,44 @@ static int wcd938x_irq_init(struct wcd938x_priv *wcd, struct device *dev)
 		return -EINVAL;
 	}
 
-	return devm_regmap_add_irq_chip(dev, wcd->regmap,
-					irq_create_mapping(wcd->virq, 0),
-					IRQF_ONESHOT, 0, &wcd938x_regmap_irq_chip,
-					&wcd->irq_chip);
+	irq = irq_create_mapping(wcd->virq, 0);
+	if (!irq) {
+		ret = -ENOMEM;
+		goto err_domain;
+	}
+	/* The aggregate can unbind without removing the platform device. */
+	ret = regmap_add_irq_chip(wcd->regmap, irq, IRQF_ONESHOT, 0,
+				 &wcd938x_regmap_irq_chip, &wcd->irq_chip);
+	if (ret) {
+		irq_dispose_mapping(irq);
+		goto err_domain;
+	}
+	return 0;
+
+err_domain:
+	irq_domain_remove(wcd->virq);
+	wcd->virq = NULL;
+	return ret;
+}
+
+static void wcd938x_irq_exit(struct wcd938x_priv *wcd)
+{
+	struct sdw_slave *rx = dev_to_sdw_dev(wcd->rxdev);
+	unsigned int irq = irq_find_mapping(wcd->virq, 0);
+
+	/* SoundWire holds sdw_dev_lock while invoking the interrupt callback.
+	 * Drain both callbacks before freeing the domain they dispatch through.
+	 */
+	scoped_guard(mutex, &rx->sdw_dev_lock)
+		wcd->sdw_priv[AIF1_PB]->slave_irq = NULL;
+	scoped_guard(mutex, &wcd->tx_sdw_dev->sdw_dev_lock)
+		wcd->sdw_priv[AIF1_CAP]->slave_irq = NULL;
+
+	regmap_del_irq_chip(irq, wcd->irq_chip);
+	irq_dispose_mapping(irq);
+	irq_domain_remove(wcd->virq);
+	wcd->irq_chip = NULL;
+	wcd->virq = NULL;
 }
 
 static int wcd938x_soc_codec_probe(struct snd_soc_component *component)
@@ -3409,6 +3445,7 @@ static int wcd938x_bind(struct device *dev)
 	if (ret) {
 		dev_err(dev, "%s: Codec registration failed\n",
 				__func__);
+		wcd938x_irq_exit(wcd938x);
 		goto err_remove_rx_link;
 	}
 
@@ -3435,6 +3472,7 @@ static void wcd938x_unbind(struct device *dev)
 	struct wcd938x_priv *wcd938x = dev_get_drvdata(dev);
 
 	snd_soc_unregister_component(dev);
+	wcd938x_irq_exit(wcd938x);
 	device_link_remove(dev, wcd938x->txdev);
 	device_link_remove(dev, wcd938x->rxdev);
 	device_link_remove(wcd938x->rxdev, wcd938x->txdev);
