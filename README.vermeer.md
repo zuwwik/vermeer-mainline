@@ -42,9 +42,34 @@ audio repository contains native voice routing and media-state restoration.
 Bluetooth desktop audio and modem-call Bluetooth routing are separate paths.
 GPS fixes and simultaneous SMS reception on both SIMs have not been validated.
 
-The tree includes FastRPC buffer lifetime/probe fixes and one-shot DSP handover
-interrupt handling. These do not establish a fix for every spontaneous closed
-ADSP charger-firmware exception or SoundWire clock-stop timeout.
+The tree includes FastRPC buffer lifetime/probe fixes, serialized endpoint
+removal, single-response ownership and cleanup of parked caller references.
+UCSI recovery handles repeated and coalesced GLINK service restarts without
+reusing freed connectors. DSP handover interrupts are handled once.
+These changes do not establish a fix for every spontaneous closed ADSP
+charger-firmware exception or SoundWire clock-stop timeout.
 
-Host checks for the DMA-buffer lifetime and battery protocol are under
-`tools/testing/vermeer/`. They do not force a live DSP crash.
+Host checks are under `tools/testing/vermeer/`:
+
+```sh
+python3 tools/testing/vermeer/test-vermeer-battmgr.py
+python3 tools/testing/vermeer/test-fastrpc-buffer.py
+python3 tools/testing/vermeer/test-adsp-transport.py
+python3 tools/testing/vermeer/test-fastrpc-reply.py
+python3 tools/testing/vermeer/test-fastrpc-close.py
+```
+
+They exercise actual driver functions with a mock transport and ASan/UBSan.
+They do not force a live DSP crash.
+
+For a bounded diagnostic capture on the phone, run as root:
+
+```sh
+python3 tools/testing/vermeer/observe-adsp.py --seconds 3600
+```
+
+This records kernel messages, stock charger GET logs and device state under
+`/var/log/vermeer-adsp/<boot-id>/`. It keeps at most two 8 MiB files, stops
+after an hour or at low charge with net discharge, and leaves audio routing
+unchanged. The firmware log channel supports one capture per ordinary boot;
+the battery transport is not rebound.
