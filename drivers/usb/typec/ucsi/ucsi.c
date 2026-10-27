@@ -1559,7 +1559,7 @@ void ucsi_connector_change(struct ucsi *ucsi, u8 num)
 {
 	struct ucsi_connector *con;
 
-	if (!(ucsi->ntfy & UCSI_ENABLE_NTFY_CONNECTOR_CHANGE)) {
+	if (!(READ_ONCE(ucsi->ntfy) & UCSI_ENABLE_NTFY_CONNECTOR_CHANGE)) {
 		dev_dbg(ucsi->dev, "Early connector change event\n");
 		return;
 	}
@@ -2365,20 +2365,27 @@ void ucsi_unregister(struct ucsi *ucsi)
 	/* Make sure that we are not in the middle of driver initialization */
 	cancel_delayed_work_sync(&ucsi->work);
 	cancel_work_sync(&ucsi->resume_work);
+	ucsi_debugfs_unregister(ucsi);
+
+	/* Late command completions remain valid, connector changes do not. */
+	WRITE_ONCE(ucsi->ntfy, 0);
 
 	/* Disable notifications */
 	ucsi->ops->async_control(ucsi, cmd);
 
-	if (!ucsi->connector)
-		return;
-
-	for (i = 0; i < ucsi->cap.num_connectors; i++) {
-		cancel_work_sync(&ucsi->connector[i].work);
-		ucsi_unregister_port(&ucsi->connector[i]);
-		lockdep_unregister_key(&ucsi->connector[i].lock_key);
+	if (ucsi->connector) {
+		for (i = 0; i < ucsi->cap.num_connectors; i++) {
+			cancel_work_sync(&ucsi->connector[i].work);
+			ucsi_unregister_port(&ucsi->connector[i]);
+			lockdep_unregister_key(&ucsi->connector[i].lock_key);
+		}
 	}
 
 	kfree(ucsi->connector);
+	ucsi->connector = NULL;
+	memset(&ucsi->cap, 0, sizeof(ucsi->cap));
+	/* A cancelled connector worker cannot acknowledge its old event. */
+	clear_bit(EVENT_PENDING, &ucsi->flags);
 }
 EXPORT_SYMBOL_GPL(ucsi_unregister);
 

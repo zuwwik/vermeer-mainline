@@ -77,6 +77,8 @@ struct pmic_glink_ucsi {
 	spinlock_t state_lock;
 	bool ucsi_registered;
 	bool pd_running;
+	bool reset_pending;
+	bool quiescing;
 
 	u8 read_buf[UCSI_BUF_V2_SIZE];
 };
@@ -88,6 +90,9 @@ static int pmic_glink_ucsi_read(struct ucsi *__ucsi, unsigned int offset,
 	struct ucsi_read_buf_req_msg req = {};
 	unsigned long left;
 	int ret;
+
+	if (offset > sizeof(ucsi->read_buf) || val_len > sizeof(ucsi->read_buf) - offset)
+		return -EINVAL;
 
 	req.hdr.owner = PMIC_GLINK_OWNER_USBC;
 	req.hdr.type = MSG_TYPE_REQ_RESP;
@@ -243,6 +248,9 @@ static void pmic_glink_ucsi_read_ack(struct pmic_glink_ucsi *ucsi, const void *d
 	u32 ret_code, resp_len, buf_len = 0;
 	u8 *buf;
 
+	if (len < sizeof(struct pmic_glink_hdr) + sizeof(u32))
+		return;
+
 	if (ucsi->ucsi->version) {
 		if (ucsi->ucsi->version >= UCSI_VERSION_2_0) {
 			buf = ((struct ucsi_read_buf_resp_msg *)data)->buf.v2_buf;
@@ -289,6 +297,9 @@ static void pmic_glink_ucsi_write_ack(struct pmic_glink_ucsi *ucsi, const void *
 {
 	const struct ucsi_write_buf_resp_msg *resp = data;
 
+	if (len != sizeof(*resp))
+		return;
+
 	if (resp->ret_code)
 		return;
 
@@ -299,6 +310,7 @@ static void pmic_glink_ucsi_notify(struct work_struct *work)
 {
 	struct pmic_glink_ucsi *ucsi = container_of(work, struct pmic_glink_ucsi, notify_work);
 	u32 cci;
+	unsigned long flags;
 	int ret;
 
 	ret = pmic_glink_ucsi_read(ucsi->ucsi, UCSI_CCI, &cci, sizeof(cci));
@@ -307,25 +319,52 @@ static void pmic_glink_ucsi_notify(struct work_struct *work)
 		return;
 	}
 
+	/* Drain connector work while still allowing its command completions. */
+	spin_lock_irqsave(&ucsi->state_lock, flags);
+	if (ucsi->quiescing)
+		cci &= UCSI_CCI_BUSY | UCSI_CCI_ACK_COMPLETE | UCSI_CCI_COMMAND_COMPLETE;
 	ucsi_notify_common(ucsi->ucsi, cci);
+	spin_unlock_irqrestore(&ucsi->state_lock, flags);
 }
 
 static void pmic_glink_ucsi_register(struct work_struct *work)
 {
 	struct pmic_glink_ucsi *ucsi = container_of(work, struct pmic_glink_ucsi, register_work);
 	unsigned long flags;
-	bool pd_running;
+	bool pd_running, reset;
+	int ret;
 
-	spin_lock_irqsave(&ucsi->state_lock, flags);
-	pd_running = ucsi->pd_running;
-	spin_unlock_irqrestore(&ucsi->state_lock, flags);
+	for (;;) {
+		spin_lock_irqsave(&ucsi->state_lock, flags);
+		pd_running = ucsi->pd_running;
+		reset = ucsi->reset_pending;
+		ucsi->reset_pending = false;
+		spin_unlock_irqrestore(&ucsi->state_lock, flags);
 
-	if (!ucsi->ucsi_registered && pd_running) {
-		ucsi_register(ucsi->ucsi);
-		ucsi->ucsi_registered = true;
-	} else if (ucsi->ucsi_registered && !pd_running) {
-		ucsi_unregister(ucsi->ucsi);
-		ucsi->ucsi_registered = false;
+		if (ucsi->ucsi_registered && (!pd_running || reset)) {
+			ucsi_unregister(ucsi->ucsi);
+			ucsi->ucsi_registered = false;
+		}
+		if (!ucsi->ucsi_registered && pd_running) {
+			ret = ucsi_register(ucsi->ucsi);
+			if (ret) {
+				dev_err(ucsi->dev, "failed to register UCSI: %d\n", ret);
+			} else {
+				ucsi->ucsi_registered = true;
+				spin_lock_irqsave(&ucsi->state_lock, flags);
+				if (ucsi->pd_running && !ucsi->reset_pending)
+					ucsi->quiescing = false;
+				spin_unlock_irqrestore(&ucsi->state_lock, flags);
+			}
+		}
+
+		/* A DOWN/UP pair can coalesce while register_work is pending. */
+		spin_lock_irqsave(&ucsi->state_lock, flags);
+		if (pd_running == ucsi->pd_running && !ucsi->reset_pending) {
+			spin_unlock_irqrestore(&ucsi->state_lock, flags);
+			break;
+		}
+		spin_unlock_irqrestore(&ucsi->state_lock, flags);
 	}
 }
 
@@ -354,6 +393,10 @@ static void pmic_glink_ucsi_pdr_notify(void *priv, int state)
 
 	spin_lock_irqsave(&ucsi->state_lock, flags);
 	ucsi->pd_running = (state == SERVREG_SERVICE_STATE_UP);
+	if (!ucsi->pd_running) {
+		ucsi->quiescing = true;
+		ucsi->reset_pending = true;
+	}
 	spin_unlock_irqrestore(&ucsi->state_lock, flags);
 	schedule_work(&ucsi->register_work);
 }
@@ -399,6 +442,7 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
 		return -ENOMEM;
 
 	ucsi->dev = dev;
+	ucsi->quiescing = true;
 	dev_set_drvdata(dev, ucsi);
 
 	INIT_WORK(&ucsi->notify_work, pmic_glink_ucsi_notify);
@@ -466,9 +510,17 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
 static void pmic_glink_ucsi_remove(struct auxiliary_device *adev)
 {
 	struct pmic_glink_ucsi *ucsi = dev_get_drvdata(&adev->dev);
+	unsigned long flags;
 
-	/* Unregister first to stop having read & writes */
-	ucsi_unregister(ucsi->ucsi);
+	disable_work_sync(&ucsi->register_work);
+	spin_lock_irqsave(&ucsi->state_lock, flags);
+	ucsi->quiescing = true;
+	spin_unlock_irqrestore(&ucsi->state_lock, flags);
+	if (ucsi->ucsi_registered) {
+		ucsi_unregister(ucsi->ucsi);
+		ucsi->ucsi_registered = false;
+	}
+	disable_work_sync(&ucsi->notify_work);
 }
 
 static const struct auxiliary_device_id pmic_glink_ucsi_id_table[] = {
