@@ -462,6 +462,21 @@ config VIDEO_OV13B10
 	  This is a Video4Linux2 sensor driver for the OmniVision
 	  OV13B10 camera.
 
+config VIDEO_OVX8000
+	tristate "OmniVision OVX8000 sensor support"
+	select V4L2_CCI_I2C
+	help
+	  V4L2 driver for the OmniVision OVX8000 main camera sensor, using
+	  a three-trio C-PHY interface and a 19.2 MHz external clock.
+
+config VIDEO_OV16A1Q
+	tristate "OmniVision OV16A1Q sensor support"
+	select V4L2_CCI_I2C
+	help
+	  V4L2 driver for the OmniVision OV16A1Q 16 megapixel sensor.
+	  To compile this driver as a module, choose M here: the
+	  module will be called ov16a1q.
+
 config VIDEO_OV32D40
 	tristate "OmniVision OV32D40 sensor support"
 	select V4L2_CCI_I2C
