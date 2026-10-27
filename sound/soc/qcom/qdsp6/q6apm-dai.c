@@ -16,6 +16,7 @@
 #include <linux/dma-mapping.h>
 #include <sound/pcm_params.h>
 #include "q6apm.h"
+#include "q6apm-voice.h"
 
 #define DRV_NAME "q6apm-dai"
 #define POS_BUFFER_BYTES	4096
@@ -85,6 +86,25 @@ struct q6apm_dai_rtd {
 
 struct q6apm_dai_data {
 	long long sid;
+};
+
+/* Hostless PCM: userspace holds the stream open; all speech samples stay
+ * between the modem and DSP. This buffer is never mapped into the DSP.
+ */
+static const struct snd_pcm_hardware q6apm_voice_hardware = {
+	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
+		SNDRV_PCM_INFO_INTERLEAVED,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.rates = SNDRV_PCM_RATE_48000,
+	.rate_min = 48000,
+	.rate_max = 48000,
+	.channels_min = 2,
+	.channels_max = 2,
+	.buffer_bytes_max = PAGE_SIZE,
+	.period_bytes_min = 256,
+	.period_bytes_max = PAGE_SIZE / 2,
+	.periods_min = 2,
+	.periods_max = 16,
 };
 
 static const struct snd_pcm_hardware q6apm_dai_hardware_capture = {
@@ -216,10 +236,13 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
-	struct audioreach_module_config cfg;
+	struct audioreach_module_config cfg = {};
 	struct device *dev = component->dev;
 	struct q6apm_dai_data *pdata;
 	int ret;
+
+	if (q6apm_voice_substream(substream))
+		return q6apm_voice_ready(component->dev) ? 0 : -EIO;
 
 	pdata = snd_soc_component_get_drvdata(component);
 	if (!pdata)
@@ -317,6 +340,9 @@ static int q6apm_dai_ack(struct snd_soc_component *component, struct snd_pcm_sub
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 	int i, ret = 0, avail_periods;
 
+	if (q6apm_voice_substream(substream))
+		return 0;
+
 	if (q6apm_is_graph_in_push_pull_mode(prtd->graph))
 		return 0;
 
@@ -341,6 +367,9 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 	int ret = 0;
+
+	if (q6apm_voice_substream(substream))
+		return 0;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -376,6 +405,13 @@ static int q6apm_dai_open(struct snd_soc_component *component,
 	int graph_id, ret;
 
 	graph_id = cpu_dai->driver->id;
+
+	if (q6apm_voice_substream(substream)) {
+		if (!q6apm_voice_ready(dev))
+			return -EBUSY;
+		runtime->hw = q6apm_voice_hardware;
+		return snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	}
 
 	pdata = snd_soc_component_get_drvdata(component);
 	if (!pdata) {
@@ -458,6 +494,9 @@ static int q6apm_dai_close(struct snd_soc_component *component,
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 
+	if (q6apm_voice_substream(substream))
+		return 0;
+
 	if (prtd->state) {
 		/* only stop graph that is started */
 		q6apm_graph_stop(prtd->graph);
@@ -478,6 +517,9 @@ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 	snd_pcm_uframes_t ptr;
+
+	if (q6apm_voice_substream(substream))
+		return 0;
 
 	if (q6apm_is_graph_in_push_pull_mode(prtd->graph)) {
 		int retries = 10;
@@ -511,6 +553,9 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
+
+	if (q6apm_voice_substream(substream))
+		return 0;
 
 	prtd->pcm_size = params_buffer_bytes(params);
 	prtd->periods = params_periods(params);
@@ -583,6 +628,11 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
 	bool is_push_pull;
 	struct snd_pcm_substream *substream = NULL;
 
+	if (!strcmp(cpu_dai->name, Q6APM_VOICE_DAI_NAME)) {
+		pcm->dev_class = SNDRV_PCM_CLASS_MODEM;
+		return snd_pcm_set_fixed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, PAGE_SIZE);
+	}
+
 	graph_id = cpu_dai->driver->id;
 
 	/* Note: DSP backend dais are uni-directional ONLY(either playback or capture) */
@@ -620,6 +670,8 @@ static void q6apm_dai_memory_unmap(struct snd_soc_component *component,
 
 	soc_prtd = snd_soc_substream_to_rtd(substream);
 	if (!soc_prtd)
+		return;
+	if (q6apm_voice_substream(substream))
 		return;
 
 	cpu_dai = snd_soc_rtd_to_cpu(soc_prtd, 0);
@@ -814,7 +866,7 @@ static int q6apm_dai_compr_set_params(struct snd_soc_component *component,
 	struct snd_compr_runtime *runtime = stream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 	struct q6apm_dai_data *pdata;
-	struct audioreach_module_config cfg;
+	struct audioreach_module_config cfg = {};
 	struct snd_codec *codec = &params->codec;
 	int dir = stream->direction;
 	int ret;

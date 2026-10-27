@@ -58,8 +58,9 @@ struct q6apm {
 	wait_queue_head_t wait;
 	struct gpr_ibasic_rsp_result_t result;
 
-	struct mutex cmd_lock;
+	struct mutex graph_lock; /* Serializes graph lifetime and voice ownership. */
 	struct mutex lock;
+	struct q6apm_voice *voice;
 	uint32_t state;
 
 	struct list_head widget_list;
@@ -96,6 +97,7 @@ struct audioreach_graph {
 typedef void (*q6apm_cb) (uint32_t opcode, uint32_t token,
 			  void *payload, void *priv);
 struct q6apm_graph {
+	struct q6apm_voice_path *voice_path;
 	void *priv;
 	q6apm_cb cb;
 	uint32_t id;

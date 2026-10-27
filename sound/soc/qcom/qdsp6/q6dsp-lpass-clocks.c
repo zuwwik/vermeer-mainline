@@ -8,6 +8,7 @@
 #include <linux/device.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/slab.h>
 #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
 #include "q6dsp-lpass-clocks.h"
@@ -113,7 +114,7 @@ static struct clk_hw *q6dsp_of_clk_hw_get(struct of_phandle_args *clkspec,
 	unsigned int idx = clkspec->args[0];
 	unsigned int attr = clkspec->args[1];
 
-	if (idx >= Q6DSP_MAX_CLK_ID || attr > LPASS_CLK_ATTRIBUTE_COUPLE_DIVISOR) {
+	if (idx >= Q6DSP_MAX_CLK_ID || attr > LPASS_CLK_ATTRIBUTE_INVERT_COUPLE_NO) {
 		dev_err(cc->dev, "Invalid clk specifier (%d, %d)\n", idx, attr);
 		return ERR_PTR(-EINVAL);
 	}
@@ -124,6 +125,48 @@ static struct clk_hw *q6dsp_of_clk_hw_get(struct of_phandle_args *clkspec,
 	}
 
 	return ERR_PTR(-ENOENT);
+}
+
+static int q6dsp_clock_link_consumers(struct device *dev)
+{
+	struct of_phandle_args args;
+	struct platform_device *consumer;
+	struct device_node *node;
+	struct device_link *link;
+	bool match;
+	int i;
+
+	/* GPR services appear after remoteproc binds. fw_devlink can therefore
+	 * collapse these clock dependencies to the remoteproc ancestor. That
+	 * leaves live codecs using unregistered clocks after an ADSP restart.
+	 * Preserve the actual DT clock supplier and let the driver core order
+	 * consumer teardown and reprobe; do not hardcode a particular codec.
+	 */
+	for_each_node_with_property(node, "clocks") {
+		if (!of_device_is_available(node))
+			continue;
+		match = false;
+		for (i = 0; !of_parse_phandle_with_args(node, "clocks",
+						      "#clock-cells", i, &args); i++) {
+			match = args.np == dev->of_node;
+			of_node_put(args.np);
+			if (match)
+				break;
+		}
+		if (!match)
+			continue;
+		consumer = of_find_device_by_node(node);
+		if (!consumer)
+			continue;
+		link = device_link_add(&consumer->dev, dev, DL_FLAG_AUTOPROBE_CONSUMER);
+		put_device(&consumer->dev);
+		if (!link) {
+			dev_err(dev, "failed to link clock consumer %pOF\n", node);
+			of_node_put(node);
+			return -EINVAL;
+		}
+	}
+	return 0;
 }
 
 int q6dsp_clock_dev_probe(struct platform_device *pdev)
@@ -180,6 +223,6 @@ int q6dsp_clock_dev_probe(struct platform_device *pdev)
 
 	dev_set_drvdata(dev, cc);
 
-	return 0;
+	return q6dsp_clock_link_consumers(dev);
 }
 EXPORT_SYMBOL_GPL(q6dsp_clock_dev_probe);

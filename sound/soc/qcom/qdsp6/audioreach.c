@@ -152,6 +152,34 @@ struct apm_i2s_module_intf_cfg {
 
 #define APM_I2S_INTF_CFG_PSIZE ALIGN(sizeof(struct apm_i2s_module_intf_cfg), 8)
 
+struct apm_tdm_module_intf_cfg {
+	struct apm_module_param_data param_data;
+	struct param_id_tdm_intf_cfg cfg;
+} __packed;
+
+#define APM_TDM_INTF_CFG_PSIZE ALIGN(sizeof(struct apm_tdm_module_intf_cfg), 8)
+
+struct apm_tdm_module_lane_cfg {
+	struct apm_module_param_data param_data;
+	struct param_id_tdm_lane_cfg cfg;
+} __packed;
+
+#define APM_TDM_LANE_CFG_PSIZE ALIGN(sizeof(struct apm_tdm_module_lane_cfg), 8)
+
+struct apm_module_hw_intf_clk_cfg {
+	struct apm_module_param_data param_data;
+	struct param_id_hw_intf_clk_cfg cfg;
+} __packed;
+
+#define APM_HW_INTF_CLK_CFG_PSIZE ALIGN(sizeof(struct apm_module_hw_intf_clk_cfg), 8)
+
+struct apm_audio_if_module_intf_cfg {
+	struct apm_module_param_data param_data;
+	struct param_id_audio_if_intf_cfg cfg;
+} __packed;
+
+#define APM_AUDIO_IF_INTF_CFG_PSIZE ALIGN(sizeof(struct apm_audio_if_module_intf_cfg), 8)
+
 struct apm_module_hw_ep_mf_cfg {
 	struct apm_module_param_data param_data;
 	struct param_id_hw_ep_mf mf;
@@ -167,6 +195,13 @@ struct apm_module_frame_size_factor_cfg {
 } __packed;
 
 #define APM_FS_CFG_PSIZE ALIGN(sizeof(struct apm_module_frame_size_factor_cfg), 8)
+
+struct apm_module_hw_ep_frame_duration_cfg {
+	struct apm_module_param_data param_data;
+	struct param_id_hw_ep_frame_duration frame_duration;
+} __packed;
+
+#define APM_HW_EP_FRAME_DURATION_PSIZE ALIGN(sizeof(struct apm_module_hw_ep_frame_duration_cfg), 8)
 
 struct apm_module_hw_ep_power_mode_cfg {
 	struct apm_module_param_data param_data;
@@ -392,6 +427,7 @@ static void apm_populate_module_list_obj(struct apm_mod_list_obj *obj,
 
 static void audioreach_populate_graph(struct q6apm *apm,
 				      const struct audioreach_graph_info *info,
+				      const struct apm_module_conn_obj *connection,
 				      struct apm_graph_open_params *open,
 				      const struct list_head *sg_list,
 				      int num_sub_graphs)
@@ -414,12 +450,9 @@ static void audioreach_populate_graph(struct q6apm *apm,
 	mlobj = &ml_data->mod_list_obj[0];
 
 
-	if (info->dst_mod_inst_id && info->src_mod_inst_id) {
+	if (connection->dst_mod_inst_id && connection->src_mod_inst_id) {
 		conn_obj = &mc_data->conn_obj[nconn];
-		conn_obj->src_mod_inst_id = info->src_mod_inst_id;
-		conn_obj->src_mod_op_port_id = info->src_mod_op_port_id;
-		conn_obj->dst_mod_inst_id = info->dst_mod_inst_id;
-		conn_obj->dst_mod_ip_port_id = info->dst_mod_ip_port_id;
+		*conn_obj = *connection;
 		nconn++;
 	}
 
@@ -466,7 +499,8 @@ static void audioreach_populate_graph(struct q6apm *apm,
 }
 
 void *audioreach_alloc_graph_pkt(struct q6apm *apm,
-				 const struct audioreach_graph_info *info)
+				 const struct audioreach_graph_info *info,
+				 const struct apm_module_conn_obj *connection)
 {
 	int payload_size, sg_sz, cont_sz, ml_sz, mp_sz, mc_sz;
 	struct apm_module_param_data  *param_data;
@@ -492,7 +526,7 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
 	ml_sz = 0;
 
 	/* add FE-BE connections */
-	if (info->dst_mod_inst_id && info->src_mod_inst_id)
+	if (connection->dst_mod_inst_id && connection->src_mod_inst_id)
 		num_connections++;
 
 	list_for_each_entry(sgs, sg_list, node) {
@@ -570,7 +604,7 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
 	params.mod_conn_list_data->num_connections = num_connections;
 	p += mc_sz;
 
-	audioreach_populate_graph(apm, info, &params, sg_list, num_sub_graphs);
+	audioreach_populate_graph(apm, info, connection, &params, sg_list, num_sub_graphs);
 
 	return pkt;
 }
@@ -1037,7 +1071,186 @@ static int audioreach_i2s_set_media_format(struct q6apm_graph *graph,
 	param_data->error_code = 0;
 	param_data->param_id = PARAM_ID_HW_EP_FRAME_SIZE_FACTOR;
 	param_data->param_size = fs_sz - APM_MODULE_PARAM_DATA_SIZE;
-	fs_cfg->frame_size_factor = 1;
+	/* Endpoint processing duration; this does not configure serial TDM slots. */
+	fs_cfg->frame_size_factor = module->frame_size_factor ?: 1;
+
+	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+}
+
+static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
+					 const struct audioreach_module *module,
+					 const struct audioreach_module_config *cfg)
+{
+	struct apm_module_frame_size_factor_cfg *fs_cfg;
+	struct apm_module_hw_intf_clk_cfg *clk_cfg;
+	struct apm_module_param_data *param_data;
+	struct apm_tdm_module_intf_cfg *intf_cfg;
+	struct apm_tdm_module_lane_cfg *lane_cfg;
+	struct apm_module_hw_ep_mf_cfg *hw_cfg;
+	u32 slot_mask = cfg->slot_mask ?: module->slot_mask;
+	u16 slots = cfg->nslots_per_frame ?: module->nslots_per_frame;
+	u16 width = cfg->slot_width ?: module->slot_width;
+	u32 lanes = module->active_lane_mask ?: 1;
+	u32 inv = cfg->fmt & SND_SOC_DAIFMT_INV_MASK;
+	u32 clock_attr = 0;
+	int ic_sz = APM_TDM_INTF_CFG_PSIZE;
+	int lc_sz = APM_TDM_LANE_CFG_PSIZE;
+	int ep_sz = APM_HW_EP_CFG_PSIZE;
+	int fs_sz = APM_FS_CFG_PSIZE;
+	int clk_sz = APM_HW_INTF_CLK_CFG_PSIZE;
+	struct gpr_pkt *pkt __free(kfree) = NULL;
+	void *p;
+
+	if (!slots || slots > 32 || !slot_mask ||
+	    (slots < 32 && (slot_mask >> slots)) ||
+	    (width != 16 && width != 24 && width != 32) ||
+	    lanes > U16_MAX || module->sync_src > 1 ||
+	    module->ctrl_data_out_enable > 1 || module->sync_mode > 2 ||
+	    module->ctrl_invert_sync_pulse > 1 || module->ctrl_sync_data_delay > 2)
+		return -EINVAL;
+
+	if (inv == SND_SOC_DAIFMT_IB_NF || inv == SND_SOC_DAIFMT_IB_IF)
+		clock_attr = AR_HW_INTF_CLK_INVERT_COUPLE_NO;
+
+	pkt = audioreach_alloc_apm_cmd_pkt(ic_sz + lc_sz + ep_sz + fs_sz + clk_sz,
+					 APM_CMD_SET_CFG, 0);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+	intf_cfg = p;
+	param_data = &intf_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->param_id = PARAM_ID_TDM_INTF_CFG;
+	param_data->param_size = sizeof(intf_cfg->cfg);
+	intf_cfg->cfg.lpaif_type = module->hw_interface_type;
+	intf_cfg->cfg.intf_idx = module->hw_interface_idx;
+	intf_cfg->cfg.sync_src = module->sync_src;
+	intf_cfg->cfg.ctrl_data_out_enable = module->ctrl_data_out_enable;
+	intf_cfg->cfg.slot_mask = slot_mask;
+	intf_cfg->cfg.nslots_per_frame = slots;
+	intf_cfg->cfg.slot_width = width;
+	intf_cfg->cfg.sync_mode = module->sync_mode;
+	intf_cfg->cfg.ctrl_invert_sync_pulse = module->ctrl_invert_sync_pulse;
+	intf_cfg->cfg.ctrl_sync_data_delay = module->ctrl_sync_data_delay;
+
+	p += ic_sz;
+	lane_cfg = p;
+	param_data = &lane_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->param_id = PARAM_ID_TDM_LANE_CFG;
+	param_data->param_size = sizeof(lane_cfg->cfg);
+	lane_cfg->cfg.lane_mask = lanes;
+
+	p += lc_sz;
+	hw_cfg = p;
+	param_data = &hw_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->param_id = PARAM_ID_HW_EP_MF_CFG;
+	param_data->param_size = sizeof(hw_cfg->mf);
+	hw_cfg->mf.sample_rate = cfg->sample_rate;
+	hw_cfg->mf.bit_width = cfg->bit_width;
+	hw_cfg->mf.num_channels = cfg->num_channels;
+	hw_cfg->mf.data_format = module->data_format;
+
+	p += ep_sz;
+	fs_cfg = p;
+	param_data = &fs_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->param_id = PARAM_ID_HW_EP_FRAME_SIZE_FACTOR;
+	param_data->param_size = sizeof(fs_cfg->frame_size_factor);
+	fs_cfg->frame_size_factor = module->frame_size_factor ?: 1;
+
+	p += fs_sz;
+	clk_cfg = p;
+	param_data = &clk_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->param_id = PARAM_ID_HW_INTF_CLK_CFG;
+	param_data->param_size = sizeof(clk_cfg->cfg);
+	/* ID/frequency/root zero let the DSP derive the clock from this endpoint. */
+	clk_cfg->cfg.clock_attri = clock_attr;
+
+	dev_info(graph->dev,
+		 "TDM endpoint %#x: LPAIF %u interface %u, slots %#x/%u x %u, lanes %#x, sync %u/%u delay %u, %u Hz %u-bit %u ch, clock attr %u\n",
+		 module->instance_id, module->hw_interface_type, module->hw_interface_idx,
+		 slot_mask, slots, width, lanes, module->sync_src, module->sync_mode,
+		 module->ctrl_sync_data_delay, cfg->sample_rate,
+		 cfg->bit_width, cfg->num_channels, clock_attr);
+
+	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+}
+
+static int audioreach_audio_if_set_media_format(struct q6apm_graph *graph,
+						const struct audioreach_module *module,
+						const struct audioreach_module_config *cfg)
+{
+	struct apm_module_hw_ep_frame_duration_cfg *fd_cfg;
+	struct apm_module_param_data *param_data;
+	struct apm_audio_if_module_intf_cfg *intf_cfg;
+	struct apm_module_hw_ep_mf_cfg *hw_cfg;
+	int ic_sz = APM_AUDIO_IF_INTF_CFG_PSIZE;
+	int ep_sz = APM_HW_EP_CFG_PSIZE;
+	int fd_sz = APM_HW_EP_FRAME_DURATION_PSIZE;
+	int size = ic_sz + ep_sz + fd_sz;
+	u32 slot_mask = cfg->slot_mask ? cfg->slot_mask : module->slot_mask;
+	u16 nslots_per_frame = cfg->nslots_per_frame ?
+				 (u16)cfg->nslots_per_frame : module->nslots_per_frame;
+	u16 slot_width = cfg->slot_width ? (u16)cfg->slot_width : module->slot_width;
+	void *p;
+
+	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(size, APM_CMD_SET_CFG, 0);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+	intf_cfg = p;
+
+	param_data = &intf_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->error_code = 0;
+	param_data->param_id = PARAM_ID_AUDIO_IF_INTF_CFG;
+	param_data->param_size = ic_sz - APM_MODULE_PARAM_DATA_SIZE;
+	intf_cfg->cfg.qaif_type = module->qaif_type;
+	intf_cfg->cfg.intf_idx = (u16)module->hw_interface_idx;
+	intf_cfg->cfg.intf_mode = module->intf_mode;
+	intf_cfg->cfg.ctrl_data_out_enable = module->ctrl_data_out_enable;
+	intf_cfg->cfg.active_slot_mask = slot_mask;
+	intf_cfg->cfg.nslots_per_frame = nslots_per_frame;
+	intf_cfg->cfg.slot_width = slot_width;
+	intf_cfg->cfg.active_lane_mask = module->active_lane_mask;
+	intf_cfg->cfg.frame_sync_rate = module->frame_sync_rate;
+	intf_cfg->cfg.frame_sync_src = module->sync_src;
+	intf_cfg->cfg.frame_sync_mode = module->sync_mode;
+	intf_cfg->cfg.invert_frame_sync_pulse = module->ctrl_invert_sync_pulse;
+	intf_cfg->cfg.frame_sync_data_delay = module->ctrl_sync_data_delay;
+	intf_cfg->cfg.bit_clk_type = module->bit_clk_type;
+	intf_cfg->cfg.inv_int_bit_clk = module->inv_int_bit_clk;
+	intf_cfg->cfg.inv_ext_bit_clk = module->inv_ext_bit_clk;
+
+	p += ic_sz;
+	hw_cfg = p;
+	param_data = &hw_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->error_code = 0;
+	param_data->param_id = PARAM_ID_HW_EP_MF_CFG;
+	param_data->param_size = ep_sz - APM_MODULE_PARAM_DATA_SIZE;
+
+	hw_cfg->mf.sample_rate = cfg->sample_rate;
+	hw_cfg->mf.bit_width = cfg->bit_width;
+	hw_cfg->mf.num_channels = cfg->num_channels;
+	hw_cfg->mf.data_format = module->data_format;
+
+	p += ep_sz;
+	fd_cfg = p;
+	param_data = &fd_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->error_code = 0;
+	param_data->param_id = PARAM_ID_HW_EP_FRAME_DURATION;
+	param_data->param_size = fd_sz - APM_MODULE_PARAM_DATA_SIZE;
+	fd_cfg->frame_duration.frame_duration_in_us = AUDIO_IF_FRAME_DURATION_US;
+	fd_cfg->frame_duration.allow_frame_duration_normalization = AUDIO_IF_FRAME_DURATION_NORMALIZATION_ENABLE;
+	fd_cfg->frame_duration.min_normalized_frame_dur_us = AUDIO_IF_FRAME_DURATION_MIN_US;
+	fd_cfg->frame_duration.max_normalized_frame_dur_us = AUDIO_IF_FRAME_DURATION_MAX_US;
 
 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
 }
@@ -1377,6 +1590,10 @@ int audioreach_set_media_format(struct q6apm_graph *graph,
 	case MODULE_ID_I2S_SINK:
 		rc = audioreach_i2s_set_media_format(graph, module, cfg);
 		break;
+	case MODULE_ID_TDM_SOURCE:
+	case MODULE_ID_TDM_SINK:
+		rc = audioreach_tdm_set_media_format(graph, module, cfg);
+		break;
 	case MODULE_ID_WR_SHARED_MEM_EP:
 	case MODULE_ID_SH_MEM_PULL_MODE:
 		rc = audioreach_shmem_set_media_format(graph, module, cfg);
@@ -1410,6 +1627,10 @@ int audioreach_set_media_format(struct q6apm_graph *graph,
 		rc = audioreach_speaker_protection_vi(graph, module, cfg);
 		if (!rc)
 			rc = audioreach_module_enable(graph, module, true);
+		break;
+	case MODULE_ID_AUDIO_IF_SOURCE:
+	case MODULE_ID_AUDIO_IF_SINK:
+		rc = audioreach_audio_if_set_media_format(graph, module, cfg);
 		break;
 
 	default:

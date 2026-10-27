@@ -17,6 +17,7 @@
 #include <sound/pcm.h>
 #include "audioreach.h"
 #include "q6apm.h"
+#include "q6apm-voice.h"
 
 /* Graph Management */
 struct apm_graph_mgmt_cmd {
@@ -41,8 +42,14 @@ int q6apm_send_cmd_sync(struct q6apm *apm, const struct gpr_pkt *pkt,
 static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
 {
 	struct audioreach_graph_info *info;
+	struct audioreach_graph_info opening;
+	struct apm_module_conn_obj connection;
 	struct audioreach_graph *graph;
 	int id;
+
+	guard(mutex)(&apm->graph_lock);
+	if (q6apm_voice_owns_audio(apm) && !q6apm_voice_media_allowed(apm, graph_id))
+		return ERR_PTR(-EBUSY);
 
 	mutex_lock(&apm->lock);
 	graph = idr_find(&apm->graph_idr, graph_id);
@@ -66,7 +73,17 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 	graph->info = info;
 	graph->id = graph_id;
 
-	graph->graph = audioreach_alloc_graph_pkt(apm, info);
+	opening = *info;
+	id = q6apm_voice_media_connection(apm, &opening);
+	if (id) {
+		kfree(graph);
+		return ERR_PTR(id);
+	}
+	connection.src_mod_inst_id = opening.src_mod_inst_id;
+	connection.src_mod_op_port_id = opening.src_mod_op_port_id;
+	connection.dst_mod_inst_id = opening.dst_mod_inst_id;
+	connection.dst_mod_ip_port_id = opening.dst_mod_ip_port_id;
+	graph->graph = audioreach_alloc_graph_pkt(apm, info, &connection);
 	if (IS_ERR(graph->graph)) {
 		void *err = graph->graph;
 
@@ -87,7 +104,15 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 
 	kref_init(&graph->refcount);
 
-	q6apm_send_cmd_sync(apm, graph->graph, 0);
+	id = q6apm_send_cmd_sync(apm, graph->graph, 0);
+	if (id) {
+		mutex_lock(&apm->lock);
+		idr_remove(&apm->graph_idr, graph_id);
+		mutex_unlock(&apm->lock);
+		kfree(graph->graph);
+		kfree(graph);
+		return ERR_PTR(id);
+	}
 
 	return graph;
 }
@@ -129,6 +154,7 @@ static void q6apm_put_audioreach_graph(struct kref *ref)
 	graph = container_of(ref, struct audioreach_graph, refcount);
 	apm = graph->apm;
 
+	guard(mutex)(&apm->graph_lock);
 	audioreach_graph_mgmt_cmd(graph, APM_CMD_GRAPH_CLOSE);
 
 	mutex_lock(&apm->lock);
@@ -216,8 +242,9 @@ static int __q6apm_map_memory_fixed_region(struct device *dev, unsigned int grap
 	uint32_t buf_sz;
 	void *p;
 	uint32_t pos_mask = is_pos_buf ? APM_MMAP_TOKEN_MAP_TYPE_POS_BUF : 0;
-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(payload_size,
-					APM_CMD_SHARED_MEM_MAP_REGIONS, (graph_id | pos_mask));
+	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_pkt(payload_size,
+					APM_CMD_SHARED_MEM_MAP_REGIONS, graph_id | pos_mask,
+					GPR_APM_MODULE_IID);
 
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
@@ -326,8 +353,10 @@ static int __q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int gr
 	struct q6apm *apm = dev_get_drvdata(dev->parent);
 	struct audioreach_graph_info *info;
 	uint32_t mem_map_handle;
-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(sizeof(*cmd),
-						APM_CMD_SHARED_MEM_UNMAP_REGIONS, graph_id);
+	u32 token = graph_id | (is_pos_buf ? APM_MMAP_TOKEN_MAP_TYPE_POS_BUF : 0);
+	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_pkt(sizeof(*cmd),
+						APM_CMD_SHARED_MEM_UNMAP_REGIONS, token,
+						GPR_APM_MODULE_IID);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
@@ -447,6 +476,9 @@ int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_mo
 	struct audioreach_container *container;
 	struct audioreach_module *module;
 	int ret;
+
+	if (graph->voice_path)
+		return q6apm_voice_media_format(graph, cfg);
 
 	list_for_each_entry(sgs, &info->sg_list, node) {
 		list_for_each_entry(container, &sgs->container_list, node) {
@@ -723,6 +755,10 @@ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
 	struct q6apm_graph *graph;
 	int ret, iid = 0;
 
+	graph = q6apm_voice_graph_open(apm, dev, graph_id);
+	if (graph)
+		return graph;
+
 	ar_graph = q6apm_get_audioreach_graph(apm, graph_id);
 	if (IS_ERR(ar_graph)) {
 		dev_err(dev, "No graph found with id %d\n", graph_id);
@@ -784,6 +820,9 @@ int q6apm_graph_close(struct q6apm_graph *graph)
 {
 	struct audioreach_graph *ar_graph = graph->ar_graph;
 
+	if (graph->voice_path)
+		return q6apm_voice_graph_close(graph);
+
 	graph->ar_graph = NULL;
 	kref_put(&ar_graph->refcount, q6apm_put_audioreach_graph);
 	gpr_free_port(graph->port);
@@ -795,6 +834,8 @@ EXPORT_SYMBOL_GPL(q6apm_graph_close);
 
 int q6apm_graph_prepare(struct q6apm_graph *graph)
 {
+	if (graph->voice_path)
+		return q6apm_voice_graph_command(graph, APM_CMD_GRAPH_PREPARE);
 	return audioreach_graph_mgmt_cmd(graph->ar_graph, APM_CMD_GRAPH_PREPARE);
 }
 EXPORT_SYMBOL_GPL(q6apm_graph_prepare);
@@ -803,6 +844,9 @@ int q6apm_graph_start(struct q6apm_graph *graph)
 {
 	struct audioreach_graph *ar_graph = graph->ar_graph;
 	int ret = 0;
+
+	if (graph->voice_path)
+		return q6apm_voice_graph_command(graph, APM_CMD_GRAPH_START);
 
 	if (ar_graph->start_count == 0)
 		ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_START);
@@ -817,6 +861,9 @@ int q6apm_graph_stop(struct q6apm_graph *graph)
 {
 	struct audioreach_graph *ar_graph = graph->ar_graph;
 
+	if (graph->voice_path)
+		return q6apm_voice_graph_command(graph, APM_CMD_GRAPH_STOP);
+
 	if (--ar_graph->start_count > 0)
 		return 0;
 
@@ -826,6 +873,8 @@ EXPORT_SYMBOL_GPL(q6apm_graph_stop);
 
 int q6apm_graph_flush(struct q6apm_graph *graph)
 {
+	if (graph->voice_path)
+		return q6apm_voice_graph_command(graph, APM_CMD_GRAPH_FLUSH);
 	return audioreach_graph_mgmt_cmd(graph->ar_graph, APM_CMD_GRAPH_FLUSH);
 }
 EXPORT_SYMBOL_GPL(q6apm_graph_flush);
@@ -863,6 +912,7 @@ static int apm_probe(gpr_device_t *gdev)
 	dev_set_drvdata(dev, apm);
 
 	mutex_init(&apm->lock);
+	mutex_init(&apm->graph_lock);
 	apm->dev = dev;
 	apm->gdev = gdev;
 	init_waitqueue_head(&apm->wait);
@@ -879,7 +929,7 @@ static int apm_probe(gpr_device_t *gdev)
 
 	q6apm_get_apm_state(apm);
 
-	ret = snd_soc_register_component(dev, &q6apm_audio_component, NULL, 0);
+	ret = snd_soc_register_component(dev, &q6apm_audio_component, &q6apm_voice_dai, 1);
 	if (ret < 0) {
 		dev_err(dev, "failed to register q6apm: %d\n", ret);
 		return ret;
@@ -896,6 +946,7 @@ static void apm_remove(gpr_device_t *gdev)
 {
 	of_platform_depopulate(&gdev->dev);
 	snd_soc_unregister_component(&gdev->dev);
+	q6apm_voice_destroy(dev_get_drvdata(&gdev->dev));
 }
 
 struct audioreach_module *q6apm_find_module_by_mid(struct q6apm_graph *graph, uint32_t mid)
@@ -946,16 +997,17 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 			wake_up(&apm->wait);
 			break;
 		case APM_CMD_SHARED_MEM_UNMAP_REGIONS:
-			apm->result.opcode = hdr->opcode;
-			apm->result.status = 0;
-			rsp = data->payload;
-
-			info = idr_find(&apm->graph_info_idr, hdr->token);
-			if (info)
-				info->mem_map_handle = 0;
-			else
-				dev_err(dev, "Error (%d) Processing 0x%08x cmd\n", result->status,
-					result->opcode);
+			apm->result.opcode = result->opcode;
+			apm->result.status = result->status;
+			graph_id = hdr->token & APM_MMAP_TOKEN_GID_MASK;
+			is_pos_buf = hdr->token & APM_MMAP_TOKEN_MAP_TYPE_POS_BUF;
+			info = idr_find(&apm->graph_info_idr, graph_id);
+			if (info && !result->status) {
+				if (is_pos_buf)
+					info->pos_buf_mem_map_handle = 0;
+				else
+					info->mem_map_handle = 0;
+			}
 
 			wake_up(&apm->wait);
 			break;
