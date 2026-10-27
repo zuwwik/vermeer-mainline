@@ -126,9 +126,8 @@ int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len)
 	int ret;
 
 	guard(mutex)(&pg->state_lock);
-	if (!pg->ept) {
+	if (!pg->ept || pg->client_state != SERVREG_SERVICE_STATE_UP)
 		return -ECONNRESET;
-	}
 
 	start = jiffies;
 	for (;;) {
