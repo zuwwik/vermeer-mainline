@@ -5641,7 +5641,7 @@
 			};
 		};
 
-		sram@14680000 {
+		imem: sram@14680000 {
 			compatible = "qcom,sm8550-imem", "syscon", "simple-mfd";
 			reg = <0 0x14680000 0 0x2c000>;
 
