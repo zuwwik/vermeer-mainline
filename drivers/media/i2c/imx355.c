@@ -69,6 +69,9 @@
 /* number of data lanes */
 #define IMX355_DATA_LANES		4
 
+#define IMX355_PIXEL_ARRAY_WIDTH		3280
+#define IMX355_PIXEL_ARRAY_HEIGHT		2464
+
 struct imx355_reg {
 	u16 address;
 	u8 val;
@@ -85,6 +88,7 @@ struct imx355_mode {
 	u32 width;
 	/* Frame height */
 	u32 height;
+	struct v4l2_rect crop;
 
 	/* V-timing */
 	u32 fll_def;
@@ -910,6 +914,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 3280,
 		.height = 2464,
+		.crop = { 0, 0, 3280, 2464 },
 		.fll_def = 2615,
 		.fll_min = 2615,
 		.llp = 3672,
@@ -922,6 +927,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 3268,
 		.height = 2448,
+		.crop = { 8, 8, 3268, 2448 },
 		.fll_def = 2615,
 		.fll_min = 2615,
 		.llp = 3672,
@@ -934,6 +940,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 3264,
 		.height = 2448,
+		.crop = { 8, 8, 3264, 2448 },
 		.fll_def = 2615,
 		.fll_min = 2615,
 		.llp = 3672,
@@ -946,6 +953,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 1940,
 		.height = 1096,
+		.crop = { 672, 684, 1940, 1096 },
 		.fll_def = 1306,
 		.fll_min = 1306,
 		.llp = 3672,
@@ -958,6 +966,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 1936,
 		.height = 1096,
+		.crop = { 672, 684, 1936, 1096 },
 		.fll_def = 1306,
 		.fll_min = 1306,
 		.llp = 3672,
@@ -970,6 +979,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 1924,
 		.height = 1080,
+		.crop = { 680, 692, 1924, 1080 },
 		.fll_def = 1306,
 		.fll_min = 1306,
 		.llp = 3672,
@@ -982,6 +992,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 1920,
 		.height = 1080,
+		.crop = { 680, 692, 1920, 1080 },
 		.fll_def = 1306,
 		.fll_min = 1306,
 		.llp = 3672,
@@ -994,6 +1005,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 1640,
 		.height = 1232,
+		.crop = { 0, 0, 3280, 2464 },
 		.fll_def = 1306,
 		.fll_min = 1306,
 		.llp = 1836,
@@ -1006,6 +1018,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 1640,
 		.height = 922,
+		.crop = { 0, 304, 3280, 1844 },
 		.fll_def = 1306,
 		.fll_min = 1306,
 		.llp = 1836,
@@ -1018,6 +1031,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 1300,
 		.height = 736,
+		.crop = { 344, 496, 2600, 1472 },
 		.fll_def = 1306,
 		.fll_min = 1306,
 		.llp = 1836,
@@ -1030,6 +1044,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 1296,
 		.height = 736,
+		.crop = { 344, 496, 2592, 1472 },
 		.fll_def = 1306,
 		.fll_min = 1306,
 		.llp = 1836,
@@ -1042,6 +1057,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 1284,
 		.height = 720,
+		.crop = { 360, 512, 2568, 1440 },
 		.fll_def = 1306,
 		.fll_min = 1306,
 		.llp = 1836,
@@ -1054,6 +1070,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 1280,
 		.height = 720,
+		.crop = { 360, 512, 2560, 1440 },
 		.fll_def = 1306,
 		.fll_min = 1306,
 		.llp = 1836,
@@ -1066,6 +1083,7 @@ static const struct imx355_mode supported_modes[] = {
 	{
 		.width = 820,
 		.height = 616,
+		.crop = { 0, 0, 3280, 2464 },
 		.fll_def = 652,
 		.fll_min = 652,
 		.llp = 3672,
@@ -1187,6 +1205,7 @@ static int imx355_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	try_fmt->height = imx355->cur_mode->height;
 	try_fmt->code = imx355_get_format_code(imx355);
 	try_fmt->field = V4L2_FIELD_NONE;
+	*v4l2_subdev_state_get_crop(fh->state, 0) = imx355->cur_mode->crop;
 
 	mutex_unlock(&imx355->mutex);
 
@@ -1373,6 +1392,7 @@ imx355_set_pad_format(struct v4l2_subdev *sd,
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
 		*framefmt = fmt->format;
+		*v4l2_subdev_state_get_crop(sd_state, fmt->pad) = mode->crop;
 	} else {
 		imx355->cur_mode = mode;
 		pixel_rate = IMX355_LINK_FREQ_DEFAULT * 2 * 4;
@@ -1398,6 +1418,40 @@ imx355_set_pad_format(struct v4l2_subdev *sd,
 	mutex_unlock(&imx355->mutex);
 
 	return 0;
+}
+
+static int imx355_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	struct imx355 *imx355 = to_imx355(sd);
+	int ret = 0;
+
+	if (sel->pad)
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		sel->r = (struct v4l2_rect) {
+			.width = IMX355_PIXEL_ARRAY_WIDTH,
+			.height = IMX355_PIXEL_ARRAY_HEIGHT,
+		};
+		return 0;
+	case V4L2_SEL_TGT_CROP:
+		mutex_lock(&imx355->mutex);
+		if (sel->which == V4L2_SUBDEV_FORMAT_TRY)
+			sel->r = *v4l2_subdev_state_get_crop(sd_state, sel->pad);
+		else if (sel->which == V4L2_SUBDEV_FORMAT_ACTIVE)
+			sel->r = imx355->cur_mode->crop;
+		else
+			ret = -EINVAL;
+		mutex_unlock(&imx355->mutex);
+		return ret;
+	default:
+		return -EINVAL;
+	}
 }
 
 /* Start streaming */
@@ -1515,6 +1569,7 @@ static const struct v4l2_subdev_pad_ops imx355_pad_ops = {
 	.get_fmt = imx355_get_pad_format,
 	.set_fmt = imx355_set_pad_format,
 	.enum_frame_size = imx355_enum_frame_size,
+	.get_selection = imx355_get_selection,
 };
 
 static const struct v4l2_subdev_ops imx355_subdev_ops = {
