@@ -1657,6 +1657,8 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 {
 	struct fastrpc_user *fl = (struct fastrpc_user *)file->private_data;
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	struct fastrpc_invoke_ctx *ctx, *n;
+	LIST_HEAD(pending);
 	unsigned long flags;
 
 	fastrpc_release_current_dsp_process(fl);
@@ -1664,6 +1666,19 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_del(&fl->user);
 	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/*
+	 * No file operations remain. Drop the caller references left by
+	 * interrupted/timed-out invokes; outstanding replies keep their
+	 * own references and DMA buffers alive.
+	 */
+	spin_lock(&fl->lock);
+	list_splice_init(&fl->pending, &pending);
+	spin_unlock(&fl->lock);
+	list_for_each_entry_safe(ctx, n, &pending, node) {
+		list_del(&ctx->node);
+		fastrpc_context_put(ctx);
+	}
 
 	fastrpc_session_free(cctx, fl->sctx);
 	file->private_data = NULL;
