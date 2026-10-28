@@ -28,6 +28,7 @@ Kernel drivers need the matching firmware and userspace configuration:
 | [vermeer-audio](https://github.com/zuwwik/vermeer-audio) | Working topology and voice firmware, UCM, call controller and session configuration |
 | [vermeer-libcamera](https://github.com/zuwwik/vermeer-libcamera) | libcamera 0.7.2 fork with sensor helpers, native AE/AF and CPU colour processing |
 | [vermeer-camera](https://github.com/zuwwik/vermeer-camera) | Active camera tuning, pinned libcamera source, build/install tools and deployed musl runtime |
+| [vermeer-plasma-camera](https://github.com/zuwwik/vermeer-plasma-camera) | Native RAW still/JPEG 100 workflow and sensor-driven preview orientation |
 | [vermeer-userspace](https://github.com/zuwwik/vermeer-userspace) | Sensor stack patches, ModemManager, haptics and rootfs integration |
 
 ## Current limits
@@ -47,7 +48,8 @@ removal, single-response ownership and cleanup of parked caller references.
 UCSI recovery handles repeated and coalesced GLINK service restarts without
 reusing freed connectors. DSP handover interrupts are handled once.
 These changes do not establish a fix for every spontaneous closed ADSP
-charger-firmware exception or SoundWire clock-stop timeout.
+charger-firmware exception. The haptics driver disables the unused PM8550B
+SoundWire input; the two WCD9385 audio slaves remain managed normally.
 
 Host checks are under `tools/testing/vermeer/`:
 
@@ -73,3 +75,15 @@ This records kernel messages, stock charger GET logs and device state under
 after an hour or at low charge with net discharge, and leaves audio routing
 unchanged. The firmware log channel supports one capture per ordinary boot;
 the battery transport is not rebound.
+
+## GPU and idle power
+
+A740 IFPC uses its own register restore tables, with the polled HFI/OOB
+acknowledgements protected from the interrupt handler. UFS lane-clock
+references are balanced, and the unused PCIe1 controller/PHY stay disabled.
+Normal GPU/camera activity and sleep/resume were checked on Vermeer.
+
+The measured IFPC saving was modest: roughly 0.04 W in a light inter-frame
+rendering test, not a battery-life multiplier. GPU runtime suspend already
+powers it down during complete inactivity. Full SoC low-power entry remains
+unconfirmed, and the board's development clock/domain boot flags are retained.
