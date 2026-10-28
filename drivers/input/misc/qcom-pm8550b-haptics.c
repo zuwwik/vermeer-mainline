@@ -46,6 +46,10 @@
 #define  PAT_SRC_MASK			GENMASK(2, 0)
 #define   PAT_SRC_FIFO			0
 #define   PAT_SRC_DIRECT_PLAY		1
+#define HAP_CFG_SWR_ACCESS_REG		0x4E
+#define  SWR_PAT_CFG_EN_BIT		BIT(7)
+#define  SWR_PAT_INPUT_EN_BIT		BIT(6)
+#define  SWR_PAT_RES_N_BIT		BIT(5)
 #define HAP_CFG_TLRA_OL_HIGH_REG	0x5C
 #define  TLRA_OL_MSB_MASK		GENMASK(3, 0)
 #define   TLRA_STEP_US			5
@@ -1291,6 +1295,19 @@ static int qcom_haptics_probe(struct platform_device *pdev)
 	    custom_vmax_uv % (VMAX_STEP_MV * 1000))
 		return -EINVAL;
 	h->custom_vmax_mv = custom_vmax_uv / 1000;
+
+	/*
+	 * Only SPMI DIRECT_PLAY/FIFO modes are implemented by this driver.
+	 * Reset the unused SoundWire input left enabled by the bootloader:
+	 * otherwise its peripheral remains attached while HAPTICS_EN is off
+	 * and cannot complete the RX bus clock-stop deprepare sequence.
+	 * This is the same reset used by the downstream SWR slave regulator.
+	 */
+	ret = cfg_update_bits(h, HAP_CFG_SWR_ACCESS_REG,
+			      SWR_PAT_CFG_EN_BIT | SWR_PAT_INPUT_EN_BIT |
+			      SWR_PAT_RES_N_BIT, 0);
+	if (ret)
+		return dev_err_probe(h->dev, ret, "failed to reset unused SoundWire input\n");
 
 	ret = haptics_init_hap525(h);
 	if (ret)
