@@ -485,26 +485,6 @@ static int goodix_berlin_get_ic_info(struct goodix_berlin_core *cd)
 	return 0;
 }
 
-static int goodix_berlin_get_remaining_contacts(struct goodix_berlin_core *cd,
-						int n)
-{
-	size_t offset = 2 * GOODIX_BERLIN_TOUCH_SIZE +
-				GOODIX_BERLIN_CHECKSUM_SIZE;
-	u32 addr = cd->touch_data_addr + GOODIX_BERLIN_HEADER_SIZE + offset;
-	int error;
-
-	error = regmap_raw_read(cd->regmap, addr,
-				&cd->event.data[offset],
-				(n - 2) * GOODIX_BERLIN_TOUCH_SIZE);
-	if (error) {
-		dev_err_ratelimited(cd->dev, "failed to get touch data, %d\n",
-				    error);
-		return error;
-	}
-
-	return 0;
-}
-
 static void goodix_berlin_report_state(struct goodix_berlin_core *cd, int n)
 {
 	struct goodix_berlin_touch *touch_data =
@@ -546,7 +526,6 @@ static void goodix_berlin_report_state(struct goodix_berlin_core *cd, int n)
 static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
 {
 	u8 touch_num;
-	int error;
 
 	touch_num = FIELD_GET(GOODIX_BERLIN_TOUCH_COUNT_MASK,
 			      cd->event.hdr.request_type);
@@ -555,18 +534,11 @@ static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
 		return;
 	}
 
-	if (touch_num > 2) {
-		/* read additional contact data if more than 2 touch events */
-		error = goodix_berlin_get_remaining_contacts(cd, touch_num);
-		if (error)
-			return;
-	}
-
 	if (touch_num) {
 		int len = touch_num * GOODIX_BERLIN_TOUCH_SIZE +
 			  GOODIX_BERLIN_CHECKSUM_SIZE;
 		if (!goodix_berlin_checksum_valid(cd->event.data, len)) {
-			dev_err(cd->dev, "touch data checksum error: %*ph\n",
+			dev_err_ratelimited(cd->dev, "touch data checksum error: %*ph\n",
 				len, cd->event.data);
 			return;
 		}
@@ -592,45 +564,14 @@ static irqreturn_t goodix_berlin_irq(int irq, void *data)
 	int error;
 
 	/*
-	 * First, read buffer with space for 2 touch events:
-	 * - GOODIX_BERLIN_HEADER_SIZE = 8 bytes
-	 * - GOODIX_BERLIN_TOUCH_SIZE * 2 = 16 bytes
-	 * - GOODIX_BERLIN_CHECKLSUM_SIZE = 2 bytes
-	 * For a total of 26 bytes.
-	 *
-	 * If only a single finger is reported, we will read 8 bytes more than
-	 * needed:
-	 * - bytes 0-7:   Header (GOODIX_BERLIN_HEADER_SIZE)
-	 * - bytes 8-15:  Finger 0 Data
-	 * - bytes 24-25: Checksum
-	 * - bytes 18-25: Unused 8 bytes
-	 *
-	 * If 2 fingers are reported, we would have read the exact needed
-	 * amount of data and checksum would be at the end of the buffer:
-	 * - bytes 0-7:   Header (GOODIX_BERLIN_HEADER_SIZE)
-	 * - bytes 8-15:  Finger 0 Bytes 0-7
-	 * - bytes 16-23: Finger 1 Bytes 0-7
-	 * - bytes 24-25: Checksum
-	 *
-	 * If more than 2 fingers were reported, the "Checksum" bytes would
-	 * in fact contain part of the next finger data, and then
-	 * goodix_berlin_get_remaining_contacts() would complete the buffer
-	 * with the missing bytes, including the trailing checksum.
-	 * For example, if 3 fingers are reported, then we would do:
-	 * Read 1:
-	 * - bytes 0-7:   Header (GOODIX_BERLIN_HEADER_SIZE)
-	 * - bytes 8-15:  Finger 0 Bytes 0-7
-	 * - bytes 16-23: Finger 1 Bytes 0-7
-	 * - bytes 24-25: Finger 2 Bytes 0-1
-	 * Read 2 (with length of (3 - 2) * 8 = 8 bytes):
-	 * - bytes 26-31: Finger 2 Bytes 2-7
-	 * - bytes 32-33: Checksum
+	 * Read a complete event in one transaction. GT9916 firmware can update
+	 * coordinates between transfers; combining a two-contact prefix with a
+	 * later tail then produces a torn packet for three or more fingers.
+	 * Keep header and all possible contacts together, and still validate
+	 * both checksums before reporting any coordinates.
 	 */
 	error = regmap_raw_read(cd->regmap, cd->touch_data_addr,
-				&cd->event,
-				GOODIX_BERLIN_HEADER_SIZE +
-					2 * GOODIX_BERLIN_TOUCH_SIZE +
-					GOODIX_BERLIN_CHECKSUM_SIZE);
+				&cd->event, sizeof(cd->event));
 	if (error) {
 		dev_warn_ratelimited(cd->dev,
 				     "failed get event head data: %d\n", error);
