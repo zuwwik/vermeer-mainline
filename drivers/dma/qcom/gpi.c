@@ -691,7 +691,9 @@ static int gpi_send_cmd(struct gpii *gpii, struct gchan *gchan,
 	cmd_reg = IS_CHAN_CMD(gpi_cmd) ? gchan->ch_cmd_reg : gpii->ev_cmd_reg;
 	cmd = IS_CHAN_CMD(gpi_cmd) ? GPII_n_CH_CMD(gpi_cmd_info[gpi_cmd].opcode, chid) :
 				     GPII_n_EV_CMD(gpi_cmd_info[gpi_cmd].opcode, 0);
-	gpi_write_reg(gpii, cmd_reg, cmd);
+
+	/* Publish completion state before the device can raise its command IRQ. */
+	writel(cmd, cmd_reg);
 	timeout = wait_for_completion_timeout(&gpii->cmd_completion,
 					      msecs_to_jiffies(CMD_TIMEOUT_MS));
 	if (!timeout) {
@@ -717,11 +719,11 @@ static int gpi_send_cmd(struct gpii *gpii, struct gchan *gchan,
 static inline void gpi_write_ch_db(struct gchan *gchan,
 				   struct gpi_ring *ring, void *wp)
 {
-	struct gpii *gpii = gchan->gpii;
 	phys_addr_t p_wp;
 
 	p_wp = to_physical(ring, wp);
-	gpi_write_reg(gpii, gchan->ch_cntxt_db_reg, p_wp);
+	/* Descriptors must be visible to DMA before ringing the doorbell. */
+	writel(p_wp, gchan->ch_cntxt_db_reg);
 }
 
 /* program event ring DB register */
@@ -731,7 +733,7 @@ static inline void gpi_write_ev_db(struct gpii *gpii,
 	phys_addr_t p_wp;
 
 	p_wp = ring->phys_addr + (wp - ring->base);
-	gpi_write_reg(gpii, gpii->ev_cntxt_db_reg, p_wp);
+	writel(p_wp, gpii->ev_cntxt_db_reg);
 }
 
 /* process transfer completion interrupt */
@@ -1081,7 +1083,8 @@ static void gpi_process_events(struct gpii *gpii)
 	struct gchan *gchan;
 	u32 chid, type;
 
-	cntxt_rp = gpi_read_reg(gpii, gpii->ev_ring_rp_lsb_reg);
+	/* Order the DMA event contents after observing device progress. */
+	cntxt_rp = readl(gpii->ev_ring_rp_lsb_reg);
 	rp = to_virtual(ev_ring, cntxt_rp);
 
 	do {
@@ -1124,7 +1127,7 @@ static void gpi_process_events(struct gpii *gpii)
 		/* clear pending IEOB events */
 		gpi_write_reg(gpii, gpii->ieob_clr_reg, BIT(0));
 
-		cntxt_rp = gpi_read_reg(gpii, gpii->ev_ring_rp_lsb_reg);
+		cntxt_rp = readl(gpii->ev_ring_rp_lsb_reg);
 		rp = to_virtual(ev_ring, cntxt_rp);
 
 	} while (rp != ev_ring->rp);

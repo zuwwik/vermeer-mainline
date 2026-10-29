@@ -38,6 +38,18 @@ macro module is not enabled. Main-camera autofocus uses contrast, not Android
 PDAF; full 50 MP, OIS, HDR and Qualcomm ICP processing are not implemented.
 The panel exposes 60, 90 and 120 Hz modes.
 
+Goodix touch events are read as complete packets, with ten input slots. In the
+physical test the controller itself reported up to five contacts, including in
+validated raw packets; ten-finger reporting has not been established.
+
+GPI commands and DMA ring doorbells use ordered MMIO, and event progress reads
+order the following DMA-memory accesses. Kernel #79 completed 50,000 read-only
+SPI transactions, 23,538 physical touch reports, display runtime-resume cycles
+and concurrent GPU/CPU/camera/audio/sensor/UFS checks without SPI/GPI timeouts.
+The separate 15-minute health observation kept ADSP running and battery present
+in all 90 samples. This is bounded validation, not an endurance guarantee.
+Existing early display-clock and SPMI probe warnings remain separate issues.
+
 Ordinary capture uses one physical AMIC1 duplicated into two channels. The
 audio repository contains native voice routing and media-state restoration.
 Bluetooth desktop audio and modem-call Bluetooth routing are separate paths.
@@ -54,6 +66,8 @@ SoundWire input; the two WCD9385 audio slaves remain managed normally.
 Host checks are under `tools/testing/vermeer/`:
 
 ```sh
+python3 tools/testing/vermeer/test-goodix-events.py
+python3 tools/testing/vermeer/test-gpi-ordering.py
 python3 tools/testing/vermeer/test-vermeer-battmgr.py
 python3 tools/testing/vermeer/test-fastrpc-buffer.py
 python3 tools/testing/vermeer/test-adsp-transport.py
