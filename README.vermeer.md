@@ -19,15 +19,6 @@ Build fragment: `arch/arm64/configs/sm8550.config`.
 Install the Image, DTB and modules from the same build using the device's
 existing boot-image packaging process. Flashing is not performed by this tree.
 
-## Optional kernel features
-
-The SM8550 fragment also enables legacy xtables/NAT, IPv4/IPv6 routing,
-IP sets, IPVS, connection tracking and the requested optional device/security
-support with its Kconfig dependencies. `NF_DEFRAG_IPV4` and `NF_DEFRAG_IPV6`
-are built in because `NF_CONNTRACK=y`. `MMCONF_FAM10H` is x86-only and cannot
-be enabled on this ARM64 board. The existing LSM order is retained and IPE has
-no embedded boot policy. These options do not install firewall or IPE rules.
-
 ## Userspace
 
 Kernel drivers need the matching firmware and userspace configuration:
