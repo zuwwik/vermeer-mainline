@@ -246,7 +246,7 @@ static void n11_42_02_0a_dsc_fingerprint_timeout(struct work_struct *work)
 	if (ctx->enabled && ctx->fingerprint_hbm) {
 		if (n11_42_02_0a_dsc_lhbm_off(ctx)) {
 			dev_err_ratelimited(&ctx->dsi->dev, "LHBM timeout: disable failed\n");
-			mod_delayed_work(system_wq, &ctx->fingerprint_timeout,
+			mod_delayed_work(system_dfl_wq, &ctx->fingerprint_timeout,
 					 msecs_to_jiffies(100));
 		}
 	}
@@ -287,7 +287,7 @@ static ssize_t fingerprint_hbm_store(struct device *dev,
 	if (!ctx->enabled || !backlight_get_brightness(ctx->backlight))
 		return -EHOSTDOWN;
 	if (enable)
-		mod_delayed_work(system_wq, &ctx->fingerprint_timeout, msecs_to_jiffies(2000));
+		mod_delayed_work(system_dfl_wq, &ctx->fingerprint_timeout, msecs_to_jiffies(2000));
 	ret = enable ? n11_42_02_0a_dsc_lhbm_on(ctx) :
 		       n11_42_02_0a_dsc_lhbm_off(ctx);
 	if (ret) {
@@ -296,7 +296,7 @@ static ssize_t fingerprint_hbm_store(struct device *dev,
 		return ret;
 	}
 	if (enable)
-		mod_delayed_work(system_wq, &ctx->fingerprint_timeout, msecs_to_jiffies(2000));
+		mod_delayed_work(system_dfl_wq, &ctx->fingerprint_timeout, msecs_to_jiffies(2000));
 	else
 		cancel_delayed_work(&ctx->fingerprint_timeout);
 
@@ -812,7 +812,7 @@ static int n11_42_02_0a_dsc_bl_update_status(struct backlight_device *bl)
 			cancel_delayed_work(&ctx->fingerprint_timeout);
 			ret = n11_42_02_0a_dsc_lhbm_off(ctx);
 			if (ret) {
-				mod_delayed_work(system_wq, &ctx->fingerprint_timeout,
+				mod_delayed_work(system_dfl_wq, &ctx->fingerprint_timeout,
 						 msecs_to_jiffies(100));
 				goto out_unlock;
 			}
