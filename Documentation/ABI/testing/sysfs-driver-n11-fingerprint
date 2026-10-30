@@ -1,0 +1,19 @@
+What:		/sys/bus/mipi-dsi/devices/.../fingerprint_hbm
+Date:		October 2026
+Contact:	zuwwik <zuwwiks@gmail.com>
+Description:
+		Experimental N11 panel illumination for optical fingerprint capture.
+		Reading returns 1 while local HBM is active, otherwise 0. Writing
+		1 enables the panel's fixed fingerprint region using the normal
+		white 1000-nit command profile and per-panel RGB calibration from
+		UEFI SMEM item 498. Writing 0 disables illumination. Writes require
+		root. This attribute does not change the desktop backlight value.
+
+		Enabling requires an awake panel, a nonzero backlight, and valid
+		calibration. It waits four panel frames before returning. Each
+		enable request arms a two-second watchdog. Brightness changes,
+		panel disable and driver removal also stop illumination. Failed
+		disable commands are retried by the watchdog while the panel runs.
+
+		No daemon enables illumination at boot. This is a development
+		interface; libfprint, fprintd and desktop integration are pending.

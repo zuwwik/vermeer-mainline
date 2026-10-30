@@ -10,6 +10,8 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/regulator/consumer.h>
+#include <linux/soc/qcom/smem.h>
+#include <linux/workqueue.h>
 
 #include <video/mipi_display.h>
 
@@ -22,6 +24,8 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_probe_helper.h>
 
+#include "panel-n11-42-02-0a-dsc-lhbm.h"
+
 struct n11_42_02_0a_dsc {
 	struct drm_bridge bridge;
 	struct backlight_device *backlight;
@@ -30,9 +34,11 @@ struct n11_42_02_0a_dsc {
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data *supplies;
 	struct mutex lock; /* Serialize backlight writes with power and mode changes. */
+	struct delayed_work fingerprint_timeout;
 	unsigned int refresh_rate;
 	bool prepared;
 	bool enabled;
+	bool fingerprint_hbm;
 };
 
 enum n11_42_02_0a_dsc_supply {
@@ -122,6 +128,187 @@ static void n11_42_02_0a_dsc_write_reg_multi(struct mipi_dsi_multi_context *dsi_
 
 	mipi_dsi_dcs_write_buffer_multi(dsi_ctx, data, sizeof(data));
 }
+
+static int n11_42_02_0a_dsc_lhbm_parameters(struct n11_42_02_0a_dsc *ctx,
+					    struct n11_lhbm_parameters *parameters)
+{
+#if IS_REACHABLE(CONFIG_QCOM_SMEM)
+	/* UEFI supplies 28 bytes of per-panel LHBM RGB calibration on Vermeer. */
+	const void *calibration;
+	unsigned int brightness;
+	size_t size;
+
+	calibration = qcom_smem_get(QCOM_SMEM_HOST_ANY, 498, &size);
+	if (IS_ERR(calibration))
+		return PTR_ERR(calibration);
+	if (size != 28)
+		return -ENODATA;
+	/* Match the minimum programmed by the regular backlight path. */
+	brightness = max(backlight_get_brightness(ctx->backlight), 25);
+	/* The existing initialization/timing tables select flat mode on. */
+	return n11_lhbm_parameters(brightness, calibration, parameters);
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
+/* The caller holds lock and the panel is enabled. */
+static int n11_42_02_0a_dsc_lhbm_off(struct n11_42_02_0a_dsc *ctx)
+{
+	unsigned long flags = ctx->dsi->mode_flags;
+	int ret, ret2, ret3;
+
+	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	/* Use independent writes so both disable commands are attempted on error. */
+	ret = mipi_dsi_dcs_write_buffer(ctx->dsi,
+					(u8[]){ 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x02 }, 6);
+	ret2 = mipi_dsi_dcs_write_buffer(ctx->dsi, (u8[]){ 0x86, 0x00 }, 2);
+	ret3 = mipi_dsi_dcs_write_buffer(ctx->dsi, (u8[]){ 0x87, 0x20 }, 2);
+
+	ctx->dsi->mode_flags = flags;
+	if (ret >= 0 && ret2 >= 0 && ret3 >= 0)
+		ctx->fingerprint_hbm = false;
+
+	return ret < 0 ? ret : ret2 < 0 ? ret2 : ret3 < 0 ? ret3 : 0;
+}
+
+static int n11_42_02_0a_dsc_lhbm_on(struct n11_42_02_0a_dsc *ctx)
+{
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+	struct n11_lhbm_parameters parameters;
+	unsigned long flags = ctx->dsi->mode_flags;
+	u8 rgb[7] = { 0xd0 };
+	u8 alpha[] = { 0x87, 0, 0 };
+	u8 dbv[] = { 0xdf, 0, 0 };
+	int ret;
+
+	ret = n11_42_02_0a_dsc_lhbm_parameters(ctx, &parameters);
+	if (ret)
+		return ret;
+	if (!ctx->refresh_rate)
+		return -EINVAL;
+	memcpy(rgb + 1, parameters.rgb, sizeof(parameters.rgb));
+	put_unaligned_be16(parameters.alpha, alpha + 1);
+	put_unaligned_be16(parameters.dbv, dbv + 1);
+	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	ctx->fingerprint_hbm = true;
+
+	/* Stock N11 normal-white-1000nit sequence; no global brightness override. */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x02);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xcc, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x07);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0, 0xb1);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdf, 0x45, 0x00, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x13);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdf, 0x02, 0xd0, 0x0b, 0x42);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x1b);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdf, 0x02, 0x54, 0x0a, 0xc6);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x1f);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdf, 0x03, 0x4c, 0x0b, 0xbe);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x2b);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdf, 0x3f, 0xff, 0x3f, 0xff, 0x3f, 0xff);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x32);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdf, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x38);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdf, 0x00, 0x40);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x88);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdf, 0x40);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x88, 0x01, 0x02, 0xd0, 0x0b, 0x44);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0x20);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x4c);
+	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, dbv, sizeof(dbv));
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x02);
+	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, rgb, sizeof(rgb));
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x01);
+	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, alpha, sizeof(alpha));
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x87, 0x21);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x85, 0x00);
+	ctx->dsi->mode_flags = flags;
+	if (dsi_ctx.accum_err) {
+		n11_42_02_0a_dsc_lhbm_off(ctx);
+		return dsi_ctx.accum_err;
+	}
+	/* UEFI/vendor requires four displayed frames before capture. */
+	msleep(DIV_ROUND_UP(4000, ctx->refresh_rate));
+
+	return 0;
+}
+
+static void n11_42_02_0a_dsc_fingerprint_timeout(struct work_struct *work)
+{
+	struct n11_42_02_0a_dsc *ctx = container_of(to_delayed_work(work),
+					struct n11_42_02_0a_dsc, fingerprint_timeout);
+
+	guard(mutex)(&ctx->lock);
+	if (ctx->enabled && ctx->fingerprint_hbm) {
+		if (n11_42_02_0a_dsc_lhbm_off(ctx)) {
+			dev_err_ratelimited(&ctx->dsi->dev, "LHBM timeout: disable failed\n");
+			mod_delayed_work(system_wq, &ctx->fingerprint_timeout,
+					 msecs_to_jiffies(100));
+		}
+	}
+}
+
+static void n11_42_02_0a_dsc_cancel_fingerprint(void *data)
+{
+	struct n11_42_02_0a_dsc *ctx = data;
+
+	disable_delayed_work_sync(&ctx->fingerprint_timeout);
+	scoped_guard(mutex, &ctx->lock) {
+		if (ctx->enabled && ctx->fingerprint_hbm)
+			n11_42_02_0a_dsc_lhbm_off(ctx);
+	}
+}
+
+static ssize_t fingerprint_hbm_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct n11_42_02_0a_dsc *ctx = dev_get_drvdata(dev);
+
+	guard(mutex)(&ctx->lock);
+	return sysfs_emit(buf, "%u\n", ctx->fingerprint_hbm);
+}
+
+static ssize_t fingerprint_hbm_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct n11_42_02_0a_dsc *ctx = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+	guard(mutex)(&ctx->lock);
+	if (!ctx->enabled || !backlight_get_brightness(ctx->backlight))
+		return -EHOSTDOWN;
+	if (enable)
+		mod_delayed_work(system_wq, &ctx->fingerprint_timeout, msecs_to_jiffies(2000));
+	ret = enable ? n11_42_02_0a_dsc_lhbm_on(ctx) :
+		       n11_42_02_0a_dsc_lhbm_off(ctx);
+	if (ret) {
+		if (!ctx->fingerprint_hbm)
+			cancel_delayed_work(&ctx->fingerprint_timeout);
+		return ret;
+	}
+	if (enable)
+		mod_delayed_work(system_wq, &ctx->fingerprint_timeout, msecs_to_jiffies(2000));
+	else
+		cancel_delayed_work(&ctx->fingerprint_timeout);
+
+	return count;
+}
+static DEVICE_ATTR_RW(fingerprint_hbm);
+
+static struct attribute *n11_fingerprint_attrs[] = {
+	&dev_attr_fingerprint_hbm.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(n11_fingerprint);
 
 static int n11_42_02_0a_dsc_on(struct n11_42_02_0a_dsc *ctx)
 {
@@ -425,11 +612,15 @@ static int n11_42_02_0a_dsc_disable(struct n11_42_02_0a_dsc *ctx)
 {
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
 
+	cancel_delayed_work(&ctx->fingerprint_timeout);
+	if (ctx->fingerprint_hbm)
+		n11_42_02_0a_dsc_lhbm_off(ctx);
 	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
 	mipi_dsi_msleep(&dsi_ctx, 20);
 	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
 	mipi_dsi_msleep(&dsi_ctx, 100);
 	ctx->enabled = false;
+	ctx->fingerprint_hbm = false;
 
 	return dsi_ctx.accum_err;
 }
@@ -616,11 +807,22 @@ static int n11_42_02_0a_dsc_bl_update_status(struct backlight_device *bl)
 
 	mutex_lock(&ctx->lock);
 	if (ctx->enabled) {
+		if (ctx->fingerprint_hbm) {
+			/* End illumination before applying a new desktop brightness. */
+			cancel_delayed_work(&ctx->fingerprint_timeout);
+			ret = n11_42_02_0a_dsc_lhbm_off(ctx);
+			if (ret) {
+				mod_delayed_work(system_wq, &ctx->fingerprint_timeout,
+						 msecs_to_jiffies(100));
+				goto out_unlock;
+			}
+		}
 		flags = dsi->mode_flags;
 		dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
 		ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
 		dsi->mode_flags = flags;
 	}
+out_unlock:
 	mutex_unlock(&ctx->lock);
 
 	return ret;
@@ -701,6 +903,7 @@ static int n11_42_02_0a_dsc_probe(struct mipi_dsi_device *dsi)
 
 	ctx->dsi = dsi;
 	mutex_init(&ctx->lock);
+	INIT_DELAYED_WORK(&ctx->fingerprint_timeout, n11_42_02_0a_dsc_fingerprint_timeout);
 	mipi_dsi_set_drvdata(dsi, ctx);
 
 	dsi->lanes = 4;
@@ -729,7 +932,11 @@ static int n11_42_02_0a_dsc_probe(struct mipi_dsi_device *dsi)
 	if (ret)
 		return ret;
 
-	return devm_mipi_dsi_attach(dev, dsi);
+	ret = devm_mipi_dsi_attach(dev, dsi);
+	if (ret)
+		return ret;
+	/* Cancel illumination while DSI and its backlight still exist. */
+	return devm_add_action_or_reset(dev, n11_42_02_0a_dsc_cancel_fingerprint, ctx);
 }
 
 static const struct of_device_id n11_42_02_0a_dsc_of_match[] = {
@@ -743,6 +950,7 @@ static struct mipi_dsi_driver n11_42_02_0a_dsc_driver = {
 	.driver = {
 		.name = "panel-n11-42-02-0a-dsc",
 		.of_match_table = n11_42_02_0a_dsc_of_match,
+		.dev_groups = n11_fingerprint_groups,
 	},
 };
 module_mipi_dsi_driver(n11_42_02_0a_dsc_driver);
