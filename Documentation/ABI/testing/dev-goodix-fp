@@ -1,0 +1,27 @@
+What:		/dev/goodix_fp
+Date:		October 2026
+Contact:	zuwwik <zuwwiks@gmail.com>
+Description:
+		Normal-world power, reset and IRQ resources of a TEE-managed
+		Goodix fingerprint sensor. No images or templates pass through
+		this device. The trusted application is accessed separately
+		through the platform's TEE interface.
+
+		Opening the device holds the supply and is exclusive. Closing
+		it disables interrupts, asserts reset and releases the supply.
+		The ioctls in <linux/goodix-fingerprint.h> pulse reset or enable
+		and disable interrupt delivery. Reset also disables delivery.
+
+		A blocking read waits for interrupts and returns one
+		struct goodix_fp_event containing their accumulated count.
+		The reserved field is zero. Reads require a buffer at least
+		as large as that structure. With O_NONBLOCK, an empty queue
+		returns EAGAIN. poll() reports readable data or device removal.
+
+What:		/sys/bus/platform/devices/.../firmware_name
+Date:		October 2026
+Contact:	zuwwik <zuwwiks@gmail.com>
+Description:
+		Read-only trusted application name from firmware-name in the
+		device tree. This identifies the board pairing; it does not
+		claim protocol compatibility with any other Goodix sensor.

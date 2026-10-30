@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/xiaomi,vermeer-fingerprint.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Xiaomi Vermeer Goodix optical fingerprint sensor
+
+maintainers:
+  - zuwwik <zuwwiks@gmail.com>
+
+description: |
+  The sensor's SPI bus belongs to the secure world. Linux manages only
+  its supply, active-low reset and interrupt. The paired trusted application
+  performs capture and matching. This binding identifies the board assembly;
+  the exact Goodix part number is not exposed by the stock device tree.
+
+properties:
+  compatible:
+    const: xiaomi,vermeer-fingerprint
+
+  vdd-supply: true
+
+  reset-gpios:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  firmware-name:
+    description: Name of the paired trusted application, without an extension.
+    const: gfvermeer
+
+  wakeup-source: true
+
+required:
+  - compatible
+  - vdd-supply
+  - reset-gpios
+  - interrupts
+  - firmware-name
+
+additionalProperties: false

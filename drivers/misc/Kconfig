@@ -634,6 +634,18 @@ config MCHP_LAN966X_PCI
 	    - lan966x-miim (MDIO_MSCC_MIIM)
 	    - lan966x-switch (LAN966X_SWITCH)
 
+config GOODIX_FINGERPRINT
+	tristate "Goodix fingerprint sensor managed by a TEE"
+	depends on OF && GPIOLIB && REGULATOR
+	help
+	  Manage power, reset and interrupts for a Goodix fingerprint sensor
+	  whose SPI bus and recognition are owned by the trusted execution
+	  environment. Userspace accesses the trusted application separately
+	  through its TEE driver. The supply is held while the device is open.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called goodix-fingerprint.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"
