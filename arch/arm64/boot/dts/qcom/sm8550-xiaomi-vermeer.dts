@@ -55,13 +55,14 @@
 
 	fingerprint {
 		compatible = "xiaomi,vermeer-fingerprint";
+		pinctrl-names = "default";
+		pinctrl-0 = <&fingerprint_default>;
 		vdd-supply = <&vreg_l9b_2p9>;
 		reset-gpios = <&tlmm 41 GPIO_ACTIVE_LOW>;
 		interrupt-parent = <&tlmm>;
 		interrupts = <40 IRQ_TYPE_EDGE_RISING>;
 		firmware-name = "gfvermeer";
 		wakeup-source;
-		status = "disabled";
 	};
 
 	top_speaker_mux: audio-mux {
@@ -470,8 +471,8 @@
 
 		vreg_l9b_2p9: ldo9 {
 			regulator-name = "vreg_l9b_2p9";
-			regulator-min-microvolt = <2960000>;
-			regulator-max-microvolt = <3300000>;
+			regulator-min-microvolt = <3304000>;
+			regulator-max-microvolt = <3304000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 			regulator-boot-on;
 			regulator-always-on;
@@ -1076,6 +1077,24 @@
 };
 
 &tlmm {
+	fingerprint_default: fingerprint-default-state {
+		interrupt-pins {
+			pins = "gpio40";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-disable;
+			input-enable;
+		};
+
+		reset-pins {
+			pins = "gpio41";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-disable;
+			output-low;
+		};
+	};
+
 	cam_pmic_reset_default: cam-pmic-reset-default-state {
 		pins = "gpio126";
 		function = "gpio";
