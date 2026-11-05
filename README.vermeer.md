@@ -30,6 +30,30 @@ Kernel drivers need the matching firmware and userspace configuration:
 | [vermeer-camera](https://github.com/zuwwik/vermeer-camera) | Active camera tuning, pinned libcamera source, build/install tools and deployed musl runtime |
 | [vermeer-plasma-camera](https://github.com/zuwwik/vermeer-plasma-camera) | Native RAW still/JPEG 100 workflow and sensor-driven preview orientation |
 | [vermeer-userspace](https://github.com/zuwwik/vermeer-userspace) | Sensor stack patches, ModemManager, haptics and rootfs integration |
+| [vermeer-fingerprint](https://github.com/zuwwik/vermeer-fingerprint) | Native fingerprint backend, KDE optical target, PAM integration and build notes |
+| [vermeer-libfprint](https://github.com/zuwwik/vermeer-libfprint) | Native Vermeer libfprint driver |
+| [vermeer-qtee-supplicant](https://github.com/zuwwik/vermeer-qtee-supplicant) | Native QTEE filesystem listeners |
+
+## Fingerprint branch
+
+The `fingerprint-vermeer` branch adds the Goodix resource driver, board wiring,
+large QTEE shared buffers and opt-in N11 local fingerprint illumination. The
+signed trusted application handles sensor images and matching; userspace uses
+the native Linux QTEE object interface. The repositories above supply the
+backend, libfprint driver, filesystem listener and KDE target.
+
+On the test phone, repeated KDE lock-screen unlocks passed on the first capture
+after fixing the backend's secure reset/wakeup sequence. An unregistered finger
+was rejected, then the enrolled finger matched. Enrollment and deletion are
+available through KDE's user settings. Idle checks show local illumination off,
+the sensor supply vote released and on-demand services stopped. Firmware,
+per-phone calibration and sealed biometric objects are not included.
+
+The running kernel used for those checks was built from `1dce6e996`; the branch
+also contains a later workqueue API compatibility fix. This remains a
+development branch, with bounded functional testing rather than an endurance
+or biometric error-rate measurement. See the backend README for build and
+deployment details.
 
 ## Current limits
 
