@@ -1100,6 +1100,10 @@ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
 		return -EINVAL;
 
 	prop = sm8350_usb_prop_map[psp];
+	/* Xiaomi exposes the power_supply USB type through USB_ADAP_TYPE. */
+	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
+	    psp == POWER_SUPPLY_PROP_USB_TYPE)
+		prop = USB_ADAP_TYPE;
 
 	return qcom_battmgr_refresh_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 					     prop, &battmgr->usb_valid);
@@ -1647,6 +1651,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->usb.current_limit = le32_to_cpu(resp->intval.value);
 			break;
 		case USB_TYPE:
+		case USB_ADAP_TYPE:
 			battmgr->usb.usb_type = le32_to_cpu(resp->intval.value);
 			break;
 		default:

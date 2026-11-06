@@ -29,10 +29,12 @@ def main():
         "struct qcom_battmgr_message {", "struct qcom_battmgr_info {",
         "struct qcom_battmgr_status {", "struct qcom_battmgr_usb {",
         "struct qcom_battmgr_wireless {",
+        "static const u8 sm8350_usb_prop_map[] = {",
     ))
     functions = "\n".join(block(source, name + "(") for name in (
         "qcom_battmgr_request", "qcom_battmgr_request_property",
         "qcom_battmgr_refresh_property",
+        "qcom_battmgr_usb_sm8350_update",
         "qcom_battmgr_bat_property_to_wire", "qcom_battmgr_notification",
         "qcom_battmgr_sm8350_callback", "qcom_battmgr_callback",
         "qcom_battmgr_refresh_worker", "qcom_battmgr_pdr_notify",
@@ -49,6 +51,7 @@ def main():
 typedef uint8_t u8; typedef uint32_t u32; typedef int32_t s32;
 typedef uint32_t __le32; typedef uint16_t __le16;
 #define HZ 1000
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define PMIC_GLINK_OWNER_BATTMGR 32778
 #define PMIC_GLINK_REQ_RESP 1
 #define SERVREG_SERVICE_STATE_UP 1
@@ -67,6 +70,12 @@ typedef uint32_t __le32; typedef uint16_t __le16;
 #define dev_err(...) do {} while (0)
 #define fallthrough __attribute__((fallthrough))
 struct pmic_glink_hdr { __le32 owner, type, opcode; };
+enum power_supply_property {
+    POWER_SUPPLY_PROP_ONLINE, POWER_SUPPLY_PROP_VOLTAGE_NOW,
+    POWER_SUPPLY_PROP_VOLTAGE_MAX, POWER_SUPPLY_PROP_CURRENT_NOW,
+    POWER_SUPPLY_PROP_CURRENT_MAX, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+    POWER_SUPPLY_PROP_USB_TYPE,
+};
 struct work_struct { int unused; };
 struct delayed_work { struct work_struct work; };
 static unsigned int scheduled, queued, cancelled, cancelled_sync;
@@ -226,6 +235,32 @@ int main(void)
     assert(get(&b, BATT_TEMP, 3150) == 0 && wire_property == 12);
     assert(get(&b, BATT_CAPACITY, 8178) == 0 && b.status.percent == 81);
     assert(get(&b, BATT_CURR_NOW, (u32)-120000) == 0 && b.status.current_now == -120000);
+
+    /* Replay the stock USB adapter reply: PPS is wire property 7, value 8. */
+    b.service_up = true;
+    b.variant = XIAOMI_BATTMGR_SM8550;
+    fw_value = 8;
+    assert(qcom_battmgr_usb_sm8350_update(&b, POWER_SUPPLY_PROP_USB_TYPE) == 0);
+    assert(wire_property == 7 && b.usb.usb_type == 8);
+    fw_value = 8722000;
+    assert(qcom_battmgr_usb_sm8350_update(&b, POWER_SUPPLY_PROP_VOLTAGE_NOW) == 0);
+    assert(wire_property == 1 && b.usb.voltage_now == 8722000);
+    fw_value = 2750000;
+    assert(qcom_battmgr_usb_sm8350_update(&b, POWER_SUPPLY_PROP_CURRENT_MAX) == 0);
+    assert(wire_property == 4 && b.usb.current_max == 2750000);
+    fw_result = 1;
+    assert(qcom_battmgr_usb_sm8350_update(&b, POWER_SUPPLY_PROP_USB_TYPE) == -EREMOTEIO);
+    assert(b.usb.usb_type == 8);
+    fw_result = 0;
+    fw_value = 0;
+    assert(qcom_battmgr_usb_sm8350_update(&b, POWER_SUPPLY_PROP_USB_TYPE) == 0);
+    assert(wire_property == 7 && !b.usb.usb_type);
+    b.variant = QCOM_BATTMGR_SM8350;
+    fw_value = 6;
+    assert(qcom_battmgr_usb_sm8350_update(&b, POWER_SUPPLY_PROP_USB_TYPE) == 0);
+    assert(wire_property == 6 && b.usb.usb_type == 6);
+    b.service_up = false;
+
     n.hdr.opcode = BATTMGR_NOTIFICATION;
     n.notification = NOTIF_XIAOMI_PROPERTY;
     b.ack = 0;
@@ -273,6 +308,7 @@ int main(void)
     b.is_vermeer = true;
     b.variant = XIAOMI_BATTMGR_SM8550;
     b.service_up = false;
+    b.usb_valid = 0;
     old = request_count;
     assert(qcom_battmgr_refresh_property(&b, BATTMGR_BAT_PROPERTY_GET,
         BATT_CAPACITY, &b.bat_valid) == -EAGAIN);
@@ -338,6 +374,7 @@ int main(void)
         subprocess.run([str(binary)], check=True)
     print("PASS: actual C request/decoder maps Xiaomi properties in both directions")
     print("PASS: signed temperature, capacity rounding, model and current sign")
+    print("PASS: Xiaomi USB adapter type decodes PPS; voltage/current and generic USB map unchanged")
     print("PASS: unsolicited/mismatched frames cannot ACK requests; errors complete correctly")
     print("PASS: vendor/USB events update both supplies; stock read-only CAPACITY/THERMAL poll")
     print("PASS: service-down and remove cancel/stop refresh; generic property mapping unchanged")
