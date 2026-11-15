@@ -489,7 +489,12 @@ static int __maybe_unused cci_resume_runtime(struct device *dev)
 		return ret;
 
 	cci_init(cci);
-	return 0;
+	/* A powered-down target can leave a clocked master stuck. */
+	ret = cci_reset(cci);
+	if (ret)
+		cci_disable_clocks(cci);
+
+	return ret;
 }
 
 static const struct dev_pm_ops qcom_cci_pm = {
@@ -594,7 +599,7 @@ static int cci_probe(struct platform_device *pdev)
 	if (ret < 0)
 		goto disable_clocks;
 
-	pm_runtime_set_autosuspend_delay(dev, MSEC_PER_SEC);
+	pm_runtime_set_autosuspend_delay(dev, 50);
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
