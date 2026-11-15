@@ -35,6 +35,23 @@ struct ovx8000_mode {
 	struct v4l2_rect crop;
 	const struct reg_sequence *regs;
 	unsigned int num_regs;
+	const struct reg_sequence *window_regs;
+	unsigned int num_window_regs;
+};
+
+/* Full array window using the existing four-pixel binning configuration.
+ * Keep the transport, analogue setup and timing of the 1920x1080 mode.
+ */
+static const struct reg_sequence ovx8000_full_4x4_window[] = {
+	{ 0x3800, 0x00 }, { 0x3801, 0x00 },
+	{ 0x3802, 0x00 }, { 0x3803, 0x00 },
+	{ 0x3804, 0x20 }, { 0x3805, 0x1f },
+	{ 0x3806, 0x18 }, { 0x3807, 0x1f },
+	{ 0x3808, 0x08 }, { 0x3809, 0x00 },
+	{ 0x380a, 0x06 }, { 0x380b, 0x00 },
+	{ 0x388c, 0x08 }, { 0x388d, 0x00 },
+	{ 0x388e, 0x06 }, { 0x388f, 0x00 },
+	{ 0x4640, 0x00 }, { 0x4641, 0x80 },
 };
 
 static const struct ovx8000_mode ovx8000_modes[] = {
@@ -53,6 +70,13 @@ static const struct ovx8000_mode ovx8000_modes[] = {
 		.crop = { .left = 256, .top = 912, .width = 7712, .height = 4352 },
 		.regs = ovx8000_mode_1920x1080,
 		.num_regs = ARRAY_SIZE(ovx8000_mode_1920x1080),
+	}, {
+		.width = 2048, .height = 1536, .binning = 4,
+		.crop = { .width = 8224, .height = 6176 },
+		.regs = ovx8000_mode_1920x1080,
+		.num_regs = ARRAY_SIZE(ovx8000_mode_1920x1080),
+		.window_regs = ovx8000_full_4x4_window,
+		.num_window_regs = ARRAY_SIZE(ovx8000_full_4x4_window),
 	},
 };
 
@@ -187,6 +211,13 @@ static int ovx8000_enable_streams(struct v4l2_subdev *sd,
 				     sensor->mode->num_regs);
 	if (ret)
 		goto put_pm;
+	if (sensor->mode->num_window_regs) {
+		ret = regmap_multi_reg_write(sensor->regmap,
+					     sensor->mode->window_regs,
+					     sensor->mode->num_window_regs);
+		if (ret)
+			goto put_pm;
+	}
 	ret = __v4l2_ctrl_handler_setup(&sensor->ctrls);
 	if (ret)
 		goto put_pm;
