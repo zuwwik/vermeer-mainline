@@ -15,6 +15,22 @@
 
 static const struct platform_inst_fw_cap inst_fw_cap_sm8550_dec[] = {
 	{
+		.cap_id = DISPLAY_DELAY_ENABLE,
+		.min = 0,
+		.max = 1,
+		.step_or_mask = 1,
+		.value = 0,
+		.hfi_id = HFI_PROP_DECODE_ORDER_OUTPUT,
+		.flags = CAP_FLAG_INPUT_PORT,
+	},
+	{
+		.cap_id = DISPLAY_DELAY,
+		.min = 0,
+		.max = 0,
+		.step_or_mask = 1,
+		.value = 0,
+	},
+	{
 		.cap_id = PROFILE_H264,
 		.min = V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE,
 		.max = V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_HIGH,
@@ -454,6 +470,74 @@ static const struct platform_inst_fw_cap inst_fw_cap_sm8550_enc[] = {
 		.hfi_id = HFI_PROP_CABAC_SESSION,
 		.flags = CAP_FLAG_OUTPUT_PORT | CAP_FLAG_MENU,
 		.set = iris_set_entropy_mode_gen2,
+	},
+	{
+		.cap_id = REQUEST_SYNC_FRAME,
+		.min = 0,
+		.max = 1,
+		.step_or_mask = 1,
+		.value = 0,
+		.hfi_id = HFI_PROP_REQUEST_SYNC_FRAME,
+		.flags = CAP_FLAG_INPUT_PORT | CAP_FLAG_DYNAMIC_ALLOWED,
+		.set = iris_set_req_sync_frame,
+	},
+	{
+		.cap_id = DEBLOCK_MODE_H264,
+		.min = V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_ENABLED,
+		.max = V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_DISABLED_AT_SLICE_BOUNDARY,
+		.step_or_mask =
+			BIT(V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_ENABLED) |
+			BIT(V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_DISABLED) |
+			BIT(V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_DISABLED_AT_SLICE_BOUNDARY),
+		.value = V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_ENABLED,
+		.hfi_id = HFI_PROP_DEBLOCKING_MODE,
+		.flags = CAP_FLAG_OUTPUT_PORT | CAP_FLAG_MENU,
+		.set = iris_set_deblock_gen2,
+	},
+	{
+		.cap_id = DEBLOCK_ALPHA_H264,
+		.min = -6,
+		.max = 6,
+		.step_or_mask = 1,
+		.value = 0,
+		.flags = CAP_FLAG_OUTPUT_PORT,
+	},
+	{
+		.cap_id = DEBLOCK_BETA_H264,
+		.min = -6,
+		.max = 6,
+		.step_or_mask = 1,
+		.value = 0,
+		.flags = CAP_FLAG_OUTPUT_PORT,
+	},
+	{
+		.cap_id = DEBLOCK_MODE_HEVC,
+		.min = V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_DISABLED,
+		.max = V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_DISABLED_AT_SLICE_BOUNDARY,
+		.step_or_mask =
+			BIT(V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_ENABLED) |
+			BIT(V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_DISABLED) |
+			BIT(V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_DISABLED_AT_SLICE_BOUNDARY),
+		.value = V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_ENABLED,
+		.hfi_id = HFI_PROP_DEBLOCKING_MODE,
+		.flags = CAP_FLAG_OUTPUT_PORT | CAP_FLAG_MENU,
+		.set = iris_set_deblock_gen2,
+	},
+	{
+		.cap_id = DEBLOCK_TC_HEVC,
+		.min = -6,
+		.max = 6,
+		.step_or_mask = 1,
+		.value = 0,
+		.flags = CAP_FLAG_OUTPUT_PORT,
+	},
+	{
+		.cap_id = DEBLOCK_BETA_HEVC,
+		.min = -6,
+		.max = 6,
+		.step_or_mask = 1,
+		.value = 0,
+		.flags = CAP_FLAG_OUTPUT_PORT,
 	},
 	{
 		.cap_id = MIN_FRAME_QP_H264,
@@ -941,6 +1025,7 @@ static const struct platform_inst_fw_cap inst_fw_cap_sm8550_enc[] = {
 };
 
 static const u32 sm8550_vdec_input_config_params_default[] = {
+	HFI_PROP_DECODE_ORDER_OUTPUT,
 	HFI_PROP_BITSTREAM_RESOLUTION,
 	HFI_PROP_CROP_OFFSETS,
 	HFI_PROP_LUMA_CHROMA_BIT_DEPTH,
@@ -953,6 +1038,7 @@ static const u32 sm8550_vdec_input_config_params_default[] = {
 };
 
 static const u32 sm8550_vdec_input_config_param_hevc[] = {
+	HFI_PROP_DECODE_ORDER_OUTPUT,
 	HFI_PROP_BITSTREAM_RESOLUTION,
 	HFI_PROP_CROP_OFFSETS,
 	HFI_PROP_LUMA_CHROMA_BIT_DEPTH,
@@ -964,6 +1050,7 @@ static const u32 sm8550_vdec_input_config_param_hevc[] = {
 };
 
 static const u32 sm8550_vdec_input_config_param_vp9[] = {
+	HFI_PROP_DECODE_ORDER_OUTPUT,
 	HFI_PROP_BITSTREAM_RESOLUTION,
 	HFI_PROP_CROP_OFFSETS,
 	HFI_PROP_LUMA_CHROMA_BIT_DEPTH,
@@ -973,6 +1060,7 @@ static const u32 sm8550_vdec_input_config_param_vp9[] = {
 };
 
 static const u32 sm8550_vdec_input_config_param_av1[] = {
+	HFI_PROP_DECODE_ORDER_OUTPUT,
 	HFI_PROP_BITSTREAM_RESOLUTION,
 	HFI_PROP_CROP_OFFSETS,
 	HFI_PROP_LUMA_CHROMA_BIT_DEPTH,
